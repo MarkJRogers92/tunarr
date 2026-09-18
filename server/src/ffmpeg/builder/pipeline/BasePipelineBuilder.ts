@@ -867,11 +867,20 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
   }
 
   protected setRealtime() {
-    const initialBurst = this.desiredState.realtime ? 0 : 60;
-    const option = new ReadrateInputOption(
-      this.ffmpegCapabilities,
-      initialBurst,
-    );
+    // Pace ONLY when we are deliberately holding to realtime.
+    //
+    // This used to apply `-readrate 1` to every transcode, with a 60 second
+    // `-readrate_initial_burst` as the only head start. That capped how far ahead the
+    // producer could ever get at roughly one minute per ffmpeg process, whatever the
+    // session loop asked for - a measured lead of 45-90s regardless of a 300s target,
+    // because the loop's estimate counted the whole item's duration up front while the
+    // process was throttled to 1x after its burst. Applying no pacing when not in
+    // realtime lets the producer actually build the cushion, and the session loop's
+    // buffer target becomes the real bound on how far ahead it runs.
+    //
+    // The concat pipeline has its own readrate options and is untouched by this.
+    if (!this.desiredState.realtime) return;
+    const option = new ReadrateInputOption(this.ffmpegCapabilities, 0);
     this.audioInputSource?.addOption(option);
     this.videoInputSource.addOption(option);
   }

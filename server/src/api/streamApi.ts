@@ -7,6 +7,7 @@ import type { Result } from '@/types/result.js';
 import { TruthyQueryParam } from '@/types/schemas.js';
 import type { RouterPluginAsyncCallback } from '@/types/serverType.js';
 import type { Maybe } from '@/types/util.js';
+import { fileExists } from '@/util/fsUtil.js';
 import { LoggerFactory } from '@/util/logging/LoggerFactory.js';
 import { makeLocalUrl } from '@/util/serverUtil.js';
 import fastifyStatic from '@fastify/static';
@@ -324,7 +325,20 @@ export const streamApi: RouterPluginAsyncCallback = async (fastify) => {
           .send(playlist.playlist);
       }
 
-      session.onSegmentRequested(req.ip, req.params.file);
+      // Record the client's position only for an object that exists.
+      //
+      // This used to run before the existence check, so requesting an
+      // already-deleted segment moved the advertised window below the retention
+      // watermark. Since the window is also what the deletion threshold derives
+      // from, the two then disagreed and every advertised segment 404'd. Players
+      // reach this by resuming, seeking backwards, or retrying a stale URL.
+      const requestedPath = resolve(session.workingDirectory, req.params.file);
+      if (
+        requestedPath.startsWith(session.workingDirectory + sep) &&
+        (await fileExists(requestedPath))
+      ) {
+        session.onSegmentRequested(req.ip, req.params.file);
+      }
 
       if (req.params.file.endsWith('.vtt')) {
         const filePath = resolve(session.workingDirectory, req.params.file);

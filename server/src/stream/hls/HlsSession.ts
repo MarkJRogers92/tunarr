@@ -58,6 +58,13 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   #lastDelete: Dayjs = dayjs().subtract(1, 'year');
   #isFirstTranscode = true;
   #lastDiscontinuitySequence: number | undefined;
+  /**
+   * Highest segment number below which segments have been deleted.
+   *
+   * Everything below this is gone, so the advertised window must never start
+   * below it - doing so advertises pruned segments, and every one of them 404s.
+   */
+  #highestDeletedBelow = 0;
   #currentSubtitleRendition: SubtitleRenditionInfo | undefined;
   #currentAudioRenditions: AudioRenditionInfo[] = [];
 
@@ -115,8 +122,12 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     filterOpts ??= {
       type: 'before_segment_number',
       segmentNumber: this.minSegmentRequested,
-      segmentsToKeepBefore: 10,
-      // segmentFloor: this.#highestDeletedBelow,
+      // Widened from 10 (~40s) to 30 (~2 minutes) of back-buffer. A player that
+      // stalls, rebuffers, or seeks slightly backwards needs segments BEHIND its
+      // position to exist; at 40s there was very little room before the deletion
+      // floor caught up with it.
+      segmentsToKeepBefore: 30,
+      segmentFloor: this.#highestDeletedBelow,
     };
     return Result.attemptAsync(async () => {
       return await this.lock.runExclusive(async () => {
@@ -127,7 +138,11 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
             filterOpts,
             playlistLines,
             {
-              maxSegmentsToKeep: 20,
+              // Widened from 20 (~80s) to 75 (~5 minutes). This is the WINDOW the
+              // player can actually fetch, and it is the half of the buffering that
+              // is easy to miss: a deep producer-side buffer is invisible to a client
+              // if the playlist only advertises 80 seconds of it.
+              maxSegmentsToKeep: 75,
               targetDuration: this.getHlsOptions().hlsTime,
               previousDiscontinuitySequence: this.#lastDiscontinuitySequence,
               endWithDiscontinuity: false,
@@ -178,8 +193,15 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         .duration(dayjs(this.transcodedUntil).diff())
         .asSeconds();
 
-      if (transcodeBuffer <= 60) {
-        const realtime = transcodeBuffer >= 30;
+      // Raised from 60s to 300s of transcode-ahead. Measured on this machine: the
+      // encoder runs at ~4x realtime, but `-readrate 1` paces DELIVERY to ~0.94x,
+      // which is slightly under realtime and slowly drains the buffer until a stall
+      // appears. A deep cushion lets the cheap stretches (commercials, which are
+      // already 480p) build a lead that a slow stretch later spends.
+      if (transcodeBuffer <= 300) {
+        // Raised from 30s to 180s: only pace at realtime once very far ahead, so the
+        // producer bursts to refill rather than trickling at 1x.
+        const realtime = transcodeBuffer >= 180;
         this.logger.trace(
           'Transcode buffer is %d. Starting next transcode (realtime = %s)',
           transcodeBuffer,
@@ -442,6 +464,10 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       ),
       ({ seq }) => seq < sequenceNum,
     );
+
+    // Recorded whether or not anything was deleted: it is the threshold that
+    // matters, since everything below it is gone either way.
+    this.#highestDeletedBelow = Math.max(this.#highestDeletedBelow, sequenceNum);
 
     if (segments.length > 0) {
       this.logger.trace(
