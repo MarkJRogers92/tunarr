@@ -48,6 +48,19 @@ export interface HlsSessionOptions extends BaseHlsSessionOptions {
 }
 
 /**
+ * Each HLS ffmpeg process timestamps its first segment from the current wall
+ * clock. If a preceding process runs faster than realtime, it can write several
+ * minutes into the future; the next process then moves PROGRAM-DATE-TIME
+ * backwards and clients such as TiviMate stall. Keep every production job
+ * paced until timestamp continuity can be preserved independently of wall time.
+ */
+export function shouldPaceHlsTranscode(
+  _transcodeBufferSeconds: number,
+): boolean {
+  return true;
+}
+
+/**
  * Initializes an ffmpeg process that concatenates via the /playlist
  * endpoint and outputs an HLS format + segments
  */
@@ -239,15 +252,11 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         .duration(dayjs(this.transcodedUntil).diff())
         .asSeconds();
 
-      // Raised from 60s to 300s of transcode-ahead. Measured on this machine: the
-      // encoder runs at ~4x realtime, but `-readrate 1` paces DELIVERY to ~0.94x,
-      // which is slightly under realtime and slowly drains the buffer until a stall
-      // appears. A deep cushion lets the cheap stretches (commercials, which are
-      // already 480p) build a lead that a slow stretch later spends.
+      // Keep a bounded cushion, but never build it by running an individual
+      // process faster than realtime. Doing so puts PROGRAM-DATE-TIME ahead of
+      // the wall clock and makes the following process jump backwards.
       if (transcodeBuffer <= 300) {
-        // Raised from 30s to 180s: only pace at realtime once very far ahead, so the
-        // producer bursts to refill rather than trickling at 1x.
-        const realtime = transcodeBuffer >= 180;
+        const realtime = shouldPaceHlsTranscode(transcodeBuffer);
         this.logger.trace(
           'Transcode buffer is %d. Starting next transcode (realtime = %s)',
           transcodeBuffer,

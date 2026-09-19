@@ -7,7 +7,7 @@ import type { StreamProgramCalculator } from '@/stream/StreamProgramCalculator.j
 import tmp from 'tmp';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { ProgramStream } from '../ProgramStream.ts';
-import { HlsSession } from './HlsSession.js';
+import { HlsSession, shouldPaceHlsTranscode } from './HlsSession.js';
 
 vi.mock('@/util/logging/LoggerFactory.js', () => ({
   LoggerFactory: {
@@ -58,6 +58,15 @@ function makeSession(transcodeDirectory: string): HlsSession {
   );
 }
 describe('HlsSession', () => {
+  describe('transcode pacing', () => {
+    test.each([0, 60, 179, 180, 300])(
+      'paces production when the buffered duration is %i seconds',
+      (transcodeBufferSeconds) => {
+        expect(shouldPaceHlsTranscode(transcodeBufferSeconds)).toBe(true);
+      },
+    );
+  });
+
   describe('getMasterPlaylist', () => {
     let dir: tmp.DirResult;
 
