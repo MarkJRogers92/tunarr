@@ -27,6 +27,11 @@ export class PlayerContext {
     return this.streamSettings.audioOnly;
   }
 
+  /** Explicit producer policy; false for every caller that does not set it. */
+  get suppressInputThrottle() {
+    return this.streamSettings.suppressInputThrottle ?? false;
+  }
+
   get realtime() {
     return this.streamSettings.realtime;
   }
@@ -71,6 +76,14 @@ export class PlayerContext {
 export type PlayerContextStreamSettings = {
   audioOnly: boolean;
   realtime: boolean;
+  /**
+   * Explicit producer policy: omit the input throttle regardless of `realtime`.
+   *
+   * Defaults false and NO caller sets it today - it was tried for the HLS producer and
+   * reverted. Do not set it until bounded work units exist; see
+   * BasePipelineBuilder.setRealtime(). Optional, so existing callers are unchanged.
+   */
+  suppressInputThrottle?: boolean;
   streamMode: ChannelStreamMode;
   encodingMode?: StreamEncoding;
 };

@@ -20,6 +20,16 @@ import type { PixelFormat } from './builder/format/PixelFormat.ts';
 import { PixelFormatYuv420P } from './builder/format/PixelFormat.ts';
 import { FrameSize } from './builder/types.ts';
 
+/**
+ * 23.976 (24000/1001) - the constant output rate used when a transcode config asks
+ * for frame-rate normalisation.
+ *
+ * Chosen because it is the rate this channel was measured to hold when
+ * normalisation was last working (see `framerate-after-change.txt` in the ops
+ * directory: 39 of 39 samples at 24000/1001 across mixed 24/29.97/30 sources).
+ */
+export const NORMALIZED_FRAME_RATE = 24000 / 1001;
+
 export class FfmpegPlaybackParamsCalculator {
   constructor(
     private transcodeConfig: TranscodeConfigOrm,
@@ -94,13 +104,29 @@ export class FfmpegPlaybackParamsCalculator {
         params.needsPad = true;
       }
 
-      // We only have an option for maxFPS right now...
-      // if (
-      //   isNil(videoStream.framerate) ||
-      //   round(videoStream.framerate, 3) > this.ffmpegOptions.maxFPS
-      // ) {
-      //   params.frameRate = this.ffmpegOptions.maxFPS;
-      // }
+      // Frame-rate normalisation.
+      //
+      // Every item is transcoded by its own ffmpeg process, and the items in this
+      // library do not share a frame rate (100 commercials at 29.97, 50 at 30, 50 at
+      // 24; the shows are mostly 29.97). With no normalisation the OUTPUT rate simply
+      // follows whichever item is playing, so the client's decoder has to reconfigure
+      // at every item boundary. Measured on this install: the rate stepped
+      // 30/1 -> 24/1 -> 30/1 across consecutive items, and a viewer reports it as a
+      // freeze every few seconds through a break. Pinning the output to one constant
+      // CFR rate removes the reconfiguration altogether.
+      //
+      // This replaces a block that read `this.ffmpegOptions.maxFPS`, an upstream
+      // option that no longer exists here. The reference had been left commented out,
+      // which silently disabled normalisation for the SOFTWARE pipeline while the
+      // transcode config still advertised `normalizeFrameRate: true` - so the setting
+      // looked enabled and did nothing. Only the QSV pipeline still normalised, via
+      // SetFpsFilter, and this channel runs hardwareAccelerationMode 'none'.
+      //
+      // Setting params.frameRate is what makes BasePipelineBuilder emit
+      // FrameRateOutputOption (`-r <rate> -fps_mode cfr`).
+      if (this.transcodeConfig.normalizeFrameRate) {
+        params.frameRate = NORMALIZED_FRAME_RATE;
+      }
 
       params.videoTrackTimeScale = 90000;
 

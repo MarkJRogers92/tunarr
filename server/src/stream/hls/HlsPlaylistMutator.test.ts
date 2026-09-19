@@ -534,12 +534,14 @@ describe('HlsPlaylistMutator', () => {
         .length;
     }
 
-    it('DISC in middle of selected window: disc-seq=0, DISC tag emitted', () => {
-      // minSeg = max(25-10, 0) = 15 → filtered segs 15..60 (46 >= 20) → take first 20 = segs 15..34
-      // DISC between seg30 and seg31; seg31 IS in window → tag emitted, no counting
+    it('uses the newest window and folds an older DISC into disc-seq', () => {
+      // minSeg = max(25-10, 0) = 15 → preferred segs 15..60.
+      // The live-edge policy takes the newest 20 (41..60), so the DISC before
+      // seg31 is older than the served window and belongs in DISC-SEQUENCE.
       const result = trimWithSegmentFilter(25);
-      expect(discSeq(result.playlist)).toBe(0);
-      expect(discTagCount(result.playlist)).toBe(1);
+      expect(discSeq(result.playlist)).toBe(1);
+      expect(discTagCount(result.playlist)).toBe(0);
+      expect(result.sequence).toBe(41);
     });
 
     it('DISC immediately before first selected segment: folded into disc-seq, no tag emitted', () => {
@@ -572,8 +574,10 @@ describe('HlsPlaylistMutator', () => {
       const seq2 = discSeq(poll2.playlist);
       const seq3 = discSeq(poll3.playlist);
 
-      expect(seq1).toBe(0);
-      expect(seq2).toBe(1); // DISC folded into disc-seq (no selected segs before it)
+      // All three requests serve the same newest 20 segments (41..60), so the
+      // older boundary is folded from the first poll onward.
+      expect(seq1).toBe(1);
+      expect(seq2).toBe(1);
       expect(seq3).toBe(1);
       expect(seq2).toBeGreaterThanOrEqual(seq1);
       expect(seq3).toBeGreaterThanOrEqual(seq2);
@@ -707,22 +711,32 @@ describe('HlsPlaylistMutator', () => {
     }
 
     it('window spanning the boundary: DISC between selected segments is emitted as tag', () => {
-      // Client at seg 45: window includes both A and B segments
-      const result = trim(45);
+      // A 40-segment live-edge window serves 40..79 and therefore spans the
+      // boundary between 49 and 50.
+      const result = mutator.trimPlaylist(
+        start,
+        {
+          type: 'before_segment_number',
+          segmentNumber: 45,
+          segmentsToKeepBefore: 10,
+        },
+        createLongPlaylist(),
+        { ...defaultOpts, maxSegmentsToKeep: 40 },
+      );
       expect(discSeq(result.playlist)).toBe(0);
       expect(discTagCount(result.playlist)).toBe(1);
       expect(result.playlist).toContain('data000049.ts'); // last of A
       expect(result.playlist).toContain('data000050.ts'); // first of B
     });
 
-    it('window just past the boundary: DISC folded into disc-seq, NOT emitted as tag', () => {
-      // Client at seg 60: first selected is seg50 (first of B).
-      // The DISC is before seg50 with no selected A segments before it.
+    it('newest window past the boundary: DISC folded into disc-seq, NOT emitted as tag', () => {
+      // The newest 20 segments are 60..79. The DISC is older than the first
+      // selected segment, with no selected A segments before it.
       // CRITICAL: must NOT emit DISC tag (would create empty period 0).
       const result = trim(60);
       expect(discSeq(result.playlist)).toBe(1);
       expect(discTagCount(result.playlist)).toBe(0);
-      expect(firstSegmentNum(result.playlist)).toBe(50);
+      expect(firstSegmentNum(result.playlist)).toBe(60);
     });
 
     it('window well past the boundary: DISC folded into disc-seq', () => {
@@ -810,10 +824,19 @@ describe('HlsPlaylistMutator', () => {
       return lines[lines.length - 1] === '#EXT-X-DISCONTINUITY';
     }
 
-    it('disc-seq capped when it would jump by more than 1', () => {
+    it('disc-seq reports every removed boundary rather than capping the increment', () => {
       // Filter to only C segments: minSeg = max(35-10,0)=25, segs 25-49 (25 segs >= 20) → take 20 = 25-44
       // Both DISC1 (before B) and DISC2 (before C) are before first selected seg.
-      // Without cap: disc-seq = 2. With previousDiscontinuitySequence=0: cap to 1, trailing DISC emitted.
+      //
+      // This test previously asserted disc-seq = 1 AND a trailing `#EXT-X-DISCONTINUITY`,
+      // i.e. it asserted the clamping behaviour itself. That behaviour has been removed:
+      // it made the published identity depend on request history rather than on the media,
+      // so the same snapshot produced 1, then 2, then 3 as a client polled it and a client
+      // could not reconcile its timeline. The expected values below are the CORRECT ones -
+      // the old test's own comment already stated "Without cap: disc-seq = 2" - and no
+      // boundary is invented at the end of the window. See
+      // HlsPlaylistMutator.invariants.test.ts for the same invariants
+      // stated directly.
       const result = mutator.trimPlaylist(
         start,
         {
@@ -829,50 +852,45 @@ describe('HlsPlaylistMutator', () => {
         },
       );
 
-      expect(discSeq(result.playlist)).toBe(1);
-      expect(result.discontinuitySequence).toBe(1);
-      expect(hasTrailingDisc(result.playlist)).toBe(true);
+      expect(discSeq(result.playlist)).toBe(2);
+      expect(result.discontinuitySequence).toBe(2);
+      expect(hasTrailingDisc(result.playlist)).toBe(false);
     });
 
-    it('gradual disc-seq catch-up over multiple polls', () => {
+    it('reports the same disc-seq on every poll of an unchanged snapshot', () => {
       const playlist = createThreeProgramPlaylist();
+      const trim = (previous: number) =>
+        mutator.trimPlaylist(
+          start,
+          {
+            type: 'before_segment_number',
+            segmentNumber: 35,
+            segmentsToKeepBefore: 10,
+          },
+          playlist,
+          {
+            ...defaultOpts,
+            maxSegmentsToKeep: 20,
+            previousDiscontinuitySequence: previous,
+          },
+        );
 
-      // Poll 1: previousDiscontinuitySequence=0 with natural disc-seq=2 → cap to 1
-      const poll1 = mutator.trimPlaylist(
-        start,
-        {
-          type: 'before_segment_number',
-          segmentNumber: 35,
-          segmentsToKeepBefore: 10,
-        },
-        playlist,
-        {
-          ...defaultOpts,
-          maxSegmentsToKeep: 20,
-          previousDiscontinuitySequence: 0,
-        },
-      );
+      // Three polls, each fed the previous response's value, exactly as the session does.
+      // Previously this sequence was the point of the test: poll 1 clamped to 1, poll 2
+      // "caught up" to 2. That was the defect, not the contract. An unchanged snapshot
+      // must yield an unchanged playlist, or a polling client sees segment identities
+      // move underneath it.
+      const poll1 = trim(0);
+      const poll2 = trim(poll1.discontinuitySequence);
+      const poll3 = trim(poll2.discontinuitySequence);
 
-      expect(discSeq(poll1.playlist)).toBe(1);
-      expect(hasTrailingDisc(poll1.playlist)).toBe(true);
-
-      // Poll 2: previous=1 → disc-seq=2, no cap needed, no trailing DISC
-      const poll2 = mutator.trimPlaylist(
-        start,
-        {
-          type: 'before_segment_number',
-          segmentNumber: 35,
-          segmentsToKeepBefore: 10,
-        },
-        playlist,
-        {
-          ...defaultOpts,
-          maxSegmentsToKeep: 20,
-          previousDiscontinuitySequence: poll1.discontinuitySequence,
-        },
-      );
-      expect(discSeq(poll2.playlist)).toBe(2);
-      expect(hasTrailingDisc(poll2.playlist)).toBe(false);
+      for (const poll of [poll1, poll2, poll3]) {
+        expect(discSeq(poll.playlist)).toBe(2);
+        expect(hasTrailingDisc(poll.playlist)).toBe(false);
+      }
+      expect(
+        new Set([poll1.playlist, poll2.playlist, poll3.playlist]).size,
+      ).toBe(1);
     });
 
     it('no trailing DISC when disc-seq does not need capping', () => {
@@ -1056,6 +1074,42 @@ describe('HlsPlaylistMutator', () => {
       // The test file has 2 leading discontinuities in the header — these are
       // FFmpeg artifacts and should be ignored. First item should be a segment.
       expect(parsed[0]?.type).toBe('segment');
+    });
+  });
+
+  describe('holding the advertised end back from the producer head', () => {
+    const start = dayjs('2024-10-18T14:00:00.000-0400');
+
+    // 30 segments of 4.004s => the head (segment 29) starts ~116s after `start`.
+    const trim = (holdBackSeconds?: number) =>
+      mutator.trimPlaylist(
+        start,
+        { type: 'before_date', before: start },
+        createPlaylist(30, 0),
+        { ...defaultOpts, maxSegmentsToKeep: 100, holdBackSeconds },
+      );
+
+    const served = (playlist: string) =>
+      playlist
+        .split('\n')
+        .filter((line) => line.includes('/hls/data'))
+        .map((line) => line.split('/').pop());
+
+    it('ends at the head by default, so existing behaviour is untouched', () => {
+      expect(served(trim().playlist).at(-1)).toBe('data000029.ts');
+    });
+
+    it('ends behind the head when asked, leaving content in front of a client', () => {
+      // 60s of hold-back against 4.004s segments withholds the newest 15.
+      const result = served(trim(60).playlist);
+      expect(result.at(-1)).toBe('data000014.ts');
+      expect(result).toHaveLength(15);
+    });
+
+    it('never holds back so far that the playlist ends up empty', () => {
+      // Asking for more hold-back than the session contains must not produce an
+      // unplayable playlist - a young session has to keep playing.
+      expect(served(trim(3600).playlist).length).toBeGreaterThan(0);
     });
   });
 });

@@ -9,7 +9,6 @@ import {
   last,
   nth,
   reject,
-  take,
   takeRight,
   trimEnd,
 } from 'lodash-es';
@@ -22,6 +21,12 @@ type MutateOptions = {
   endWithDiscontinuity: boolean;
   targetDuration: number;
   previousDiscontinuitySequence?: number;
+  /**
+   * How far behind the producer's head to end the advertised playlist. See
+   * `HOLD_BACK_SECONDS`. Omitted or 0 means "end at the head", which is the
+   * behaviour every existing caller and test expects.
+   */
+  holdBackSeconds?: number;
 };
 
 type FilterBeforeDate = {
@@ -42,6 +47,36 @@ export type HlsPlaylistFilterOptions =
   | FilterBeforeDate
   | FilterBeforeSegmentNumber;
 
+/**
+ * How far behind the producer's head to end the advertised playlist.
+ *
+ * NOT USED, and it is recorded here because it looks like the obvious fix and is
+ * actually the opposite of one.
+ *
+ * The reasoning that produced it: every client starts at the END of the playlist, the
+ * producer deliberately races ahead and then rests once it is far enough in front, and
+ * a viewer therefore began with only ~12 seconds of runway while a six minute cushion
+ * sat behind the playhead. Ending the playlist behind the head appears to put
+ * already-produced content in front of the client instead.
+ *
+ * WHY IT DOES NOT WORK, measured on a live channel: a client can only buffer as far as
+ * the playlist's END. Holding the end back from the head therefore CAPS every client's
+ * forward buffer at the hold-back gap - removing precisely the room to run that a deep
+ * buffer needs. With this at 180s the served end sat 52 segments (~208s) behind the
+ * producer's head and the viewer reported being "about 30 seconds from a freeze" while
+ * complaining the player "wasn't buffering before it got close". The buffer belongs to
+ * the CLIENT (see `web/src/hooks/useHls.ts`, where `lowLatencyMode` was pinning hls.js
+ * to the live edge), not to the playlist. Left in place, exercised by tests, and unused
+ * by HlsSession.
+ */
+export const HOLD_BACK_SECONDS = 180;
+
+/**
+ * Never hold back so far that the playlist has nothing left to serve - a young
+ * session must still produce a playable playlist.
+ */
+const MIN_SEGMENTS_TO_SERVE = 10;
+
 export class HlsPlaylistMutator {
   trimPlaylist(
     start: Dayjs,
@@ -61,6 +96,7 @@ export class HlsPlaylistMutator {
       opts.maxSegmentsToKeep,
       opts.targetDuration,
       opts.previousDiscontinuitySequence,
+      opts.holdBackSeconds ?? 0,
     );
 
     return {
@@ -131,6 +167,7 @@ export class HlsPlaylistMutator {
     maxSegmentsToKeep: number,
     targetDuration: number,
     previousDiscontinuitySequence?: number,
+    holdBackSeconds: number = 0,
   ) {
     // Count and remove leading discontinuities
     let leadingDiscontinuities = 0;
@@ -146,44 +183,99 @@ export class HlsPlaylistMutator {
       (item): item is PlaylistSegment => item.type === 'segment',
     );
 
-    if (allSegments.length > maxSegmentsToKeep) {
-      const filtered = match(filterOptions)
-        .with({ type: 'before_date' }, ({ before }) =>
-          reject(allSegments, (segment) => segment.startTime.isBefore(before)),
-        )
-        .with(
-          {
-            type: 'before_segment_number',
-          },
-          (beforeSeg) => {
-            const minSeg = Math.max(
-              beforeSeg.segmentNumber - beforeSeg.segmentsToKeepBefore,
-              beforeSeg.segmentFloor ?? 0,
-            );
-            return seq.collect(allSegments, (segment) => {
-              const fileName = basename(segment.line);
-              const matches = fileName.match(SegmentNameRegex);
-              if (!matches || matches.length < 2) {
-                return;
-              }
-              const int = parseInt(matches[1]!);
-              if (isNaN(int)) {
-                return;
-              }
-              if (int < minSeg) {
-                return;
-              }
-              return segment;
-            });
-          },
-        )
-        .exhaustive();
-
-      allSegments =
-        filtered.length >= maxSegmentsToKeep
-          ? take(filtered, maxSegmentsToKeep)
-          : takeRight(allSegments, maxSegmentsToKeep);
+    // End the window behind the producer's head - see HOLD_BACK_SECONDS. Applied
+    // before the window selection below, so the served window ends this far back and
+    // every client starts with that much already-produced content in front of it.
+    // Off unless a caller asks for it, so every existing behaviour is unchanged.
+    const headSegment = last(allSegments);
+    if (holdBackSeconds > 0 && headSegment) {
+      const cutoff = headSegment.startTime.subtract(holdBackSeconds, 'second');
+      const heldBack = reject(allSegments, (segment) =>
+        segment.startTime.isAfter(cutoff),
+      );
+      if (heldBack.length >= MIN_SEGMENTS_TO_SERVE) {
+        allSegments = heldBack;
+      }
     }
+
+    // The HARD physical floor and the SOFT playback/history anchor are separated here,
+    // deliberately and in this order.
+    //
+    // The floor answers "does this file still exist on disk". The soft filter answers
+    // "which of those does this client's position want". Conflating them let the
+    // fallback advertise deleted files: when the soft filter matched nothing, the old
+    // code fell back to the UNFILTERED list, which still contained segments below the
+    // floor, and a client then requested a URI with no file behind it. The floor was
+    // also evaluated only inside `allSegments.length > maxSegmentsToKeep`, so a playlist
+    // shorter than the window skipped it entirely. Measured against this file before the
+    // change: with a floor of 12 and 16 segments present, the served list was 6..15.
+    //
+    // Order is eligible (physical) -> preferred (soft) -> window policy applied to one of
+    // those, never to anything below the floor. A short valid list beats padding with
+    // deleted files; when nothing is eligible the result is genuinely empty, and the
+    // session/HTTP layer owns deciding that is "not ready" rather than publishing it as a
+    // healthy playable manifest.
+    const segmentNumberOf = (segment: PlaylistSegment): number | undefined => {
+      const matches = basename(segment.line).match(SegmentNameRegex);
+      if (!matches || matches.length < 2) {
+        return undefined;
+      }
+      const parsed = parseInt(matches[1]!);
+      return isNaN(parsed) ? undefined : parsed;
+    };
+
+    const physicalFloor =
+      filterOptions.type === 'before_segment_number'
+        ? (filterOptions.segmentFloor ?? 0)
+        : 0;
+    const eligible =
+      physicalFloor > 0
+        ? filter(allSegments, (segment) => {
+            const number = segmentNumberOf(segment);
+            return number !== undefined && number >= physicalFloor;
+          })
+        : allSegments;
+
+    const preferred = match(filterOptions)
+      .with({ type: 'before_date' }, ({ before }) =>
+        reject(eligible, (segment) => segment.startTime.isBefore(before)),
+      )
+      .with({ type: 'before_segment_number' }, (beforeSeg) =>
+        seq.collect(eligible, (segment) => {
+          const number = segmentNumberOf(segment);
+          if (number === undefined) {
+            return;
+          }
+          if (
+            number <
+            beforeSeg.segmentNumber - beforeSeg.segmentsToKeepBefore
+          ) {
+            return;
+          }
+          return segment;
+        }),
+      )
+      .exhaustive();
+
+    // Always the NEWEST segments, never the oldest.
+    //
+    // This previously took the FIRST maxSegmentsToKeep of the filtered set, which
+    // anchored the window to the SLOWEST client's position rather than to the live
+    // edge. Two consequences, both observed on a live install: a player that paused
+    // or a tab that was throttled pinned the window minutes behind the producer (and
+    // stayed pinned, because polling the playlist keeps a connection alive without
+    // moving its position), and everything the producer built beyond the slowest
+    // client's position was unreachable - 52 segments of a 5 minute cushion measured
+    // invisible. Taking the last N puts the window where the content actually is.
+    //
+    // The no-match fallback uses the newest of the ELIGIBLE set rather than of
+    // everything, so a window can never end up empty just because nothing met the soft
+    // anchor - while still never reaching below the physical floor.
+    const source = preferred.length > 0 ? preferred : eligible;
+    allSegments =
+      source.length > maxSegmentsToKeep
+        ? takeRight(source, maxSegmentsToKeep)
+        : source;
 
     const startSequence = first(allSegments)?.startSequence ?? 0;
 
@@ -208,19 +300,28 @@ export class HlsPlaylistMutator {
       }
     }
 
-    // Cap disc-seq so it never jumps by more than 1 between consecutive polls.
-    // When a short program is entirely filtered out of the sliding window between
-    // client polls, all its boundary DISCs are folded at once, jumping by >1.
-    // The client never saw the intermediate period, so it errors. Cap at +1 and
-    // emit a trailing DISC to pre-create the next period for the following poll.
-    let emitTrailingDisc = false;
-    if (
-      previousDiscontinuitySequence !== undefined &&
-      discontinuitySequence > previousDiscontinuitySequence + 1
-    ) {
-      discontinuitySequence = previousDiscontinuitySequence + 1;
-      emitTrailingDisc = true;
-    }
+    // NOTE: there used to be a cap here that limited this number to
+    // `previousDiscontinuitySequence + 1` and, when it clamped, invented a trailing
+    // `#EXT-X-DISCONTINUITY`. It is removed deliberately; do not restore it.
+    //
+    // It was intended to stop a client seeing the discontinuity sequence jump by more
+    // than one when several short items left the sliding window between two polls. What
+    // it actually did was make the published identity depend on REQUEST HISTORY rather
+    // than on the media: the same underlying snapshot produced `1`, then `2`, then `3`
+    // as a client polled it, because each response fed the previous response's clamped
+    // value back in as `previousDiscontinuitySequence`. Measured against this file: the
+    // same input yields three different playlists across three consecutive GETs.
+    //
+    // A client that sees a segment's discontinuity identity change underneath it cannot
+    // reconcile the timeline; it re-syncs, which presents as playback repeatedly
+    // starting again from the same place. The invariant that matters is that the
+    // identity of an overlapping segment must not change while the window moves, and
+    // that is only achievable if the count is derived purely from the snapshot.
+    //
+    // `previousDiscontinuitySequence` is therefore no longer read here. RFC 8216
+    // 6.2.1/6.2.2 require the discontinuity sequence to identify the first segment's
+    // period, not to be smoothed for the client's benefit.
+    void previousDiscontinuitySequence;
 
     const lines = [
       '#EXTM3U',
@@ -268,10 +369,6 @@ export class HlsPlaylistMutator {
           }
           break;
       }
-    }
-
-    if (emitTrailingDisc && hasEmittedSegment) {
-      lines.push('#EXT-X-DISCONTINUITY');
     }
 
     const playlist = lines.join('\n');

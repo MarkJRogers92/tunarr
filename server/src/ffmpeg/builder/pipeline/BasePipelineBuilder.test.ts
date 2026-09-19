@@ -387,4 +387,105 @@ describe('BasePipelineBuilder', () => {
 
     expect(loudnormFilter).toBeUndefined();
   });
+
+  /**
+   * Input-throttle policy.
+   *
+   * `realtime` and "do not attach an input throttle" are different questions, and the
+   * producer needs the second answered independently of the first. These tests assert on
+   * the GENERATED ARGUMENTS, not on a log line or a state flag, because the failure this
+   * guards against was precisely a flag that looked right while the command line still
+   * carried `-readrate`.
+   */
+  describe('input throttling policy', () => {
+    const framed = (
+      overrides: Partial<ConstructorParameters<typeof FrameState>[0]>,
+    ) =>
+      new FrameState({
+        isAnamorphic: false,
+        paddedSize: FrameSize.FHD,
+        scaledSize: FrameSize.FHD,
+        ...overrides,
+      });
+
+    /**
+     * Fresh input sources for every build, deliberately.
+     *
+     * `build()` MUTATES the input sources by appending options to them. Reusing one pair
+     * across builds leaks the previous build's options into the next, which made an
+     * earlier version of these tests fail while the implementation was correct: the
+     * first build attached `-readrate`, and every later build inherited it.
+     */
+    const freshInputs = () => ({
+      audio: AudioInputSource.withStream(
+        new FileStreamSource('/path/to/song.flac'),
+        AudioStream.create({ channels: 2, codec: 'flac', index: 0 }),
+        AudioState.create({
+          audioBitrate: 192,
+          audioBufferSize: 192 * 2,
+          audioChannels: 2,
+          audioVolume: 100,
+        }),
+      ),
+      video: VideoInputSource.withStream(
+        new FileStreamSource('/path/to/video.mkv'),
+        VideoStream.create({
+          codec: 'h264',
+          displayAspectRatio: '16:9',
+          frameSize: FrameSize.withDimensions(1920, 900),
+          index: 0,
+          pixelFormat: new PixelFormatYuv420P(),
+          providedSampleAspectRatio: null,
+        }),
+      ),
+    });
+
+    const buildWith = (
+      overrides: Partial<ConstructorParameters<typeof FrameState>[0]>,
+    ) => {
+      const { video: v, audio: a } = freshInputs();
+      return new NoopPipelineBuilder(
+        v,
+        a,
+        null,
+        null,
+        null,
+        EmptyFfmpegCapabilities,
+      ).build(state, framed(overrides), DefaultPipelineOptions);
+    };
+
+    /** Every input argument, both streams, as FFmpeg would receive them. */
+    const inputArgs = (result: ReturnType<typeof buildWith>) => [
+      ...(result.inputs.videoInput?.getInputOptions() ?? []),
+      ...(result.inputs.audioInput?.getInputOptions() ?? []),
+    ];
+
+    test('a realtime pipeline is throttled, exactly as before this change', () => {
+      expect(inputArgs(buildWith({ realtime: true }))).toContain('-readrate');
+    });
+
+    test('the producer policy omits the throttle entirely, even at realtime', () => {
+      const args = inputArgs(
+        buildWith({ realtime: true, suppressInputThrottle: true }),
+      );
+      expect(args).not.toContain('-readrate');
+      expect(args.filter((arg) => arg.includes('readrate'))).toEqual([]);
+    });
+
+    test('the policy is off by default, so unrelated callers are unaffected', () => {
+      // No `suppressInputThrottle` supplied at all: FrameState default must be false, so
+      // a realtime pipeline keeps the same command line it had before this change.
+      const args = inputArgs(buildWith({ realtime: true }));
+      expect(args).toContain('-readrate');
+    });
+
+    test('a non-realtime pipeline stays unpaced, with or without the policy', () => {
+      expect(inputArgs(buildWith({ realtime: false }))).not.toContain(
+        '-readrate',
+      );
+      expect(
+        inputArgs(buildWith({ realtime: false, suppressInputThrottle: true })),
+      ).not.toContain('-readrate');
+    });
+  });
 });

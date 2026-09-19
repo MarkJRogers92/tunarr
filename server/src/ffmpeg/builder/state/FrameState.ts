@@ -18,6 +18,7 @@ const DefaultFrameState: Omit<
   'scaledSize' | 'paddedSize' | 'isAnamorphic'
 > = {
   realtime: false,
+  suppressInputThrottle: false,
   videoFormat: 'h264',
   videoPreset: null,
   videoProfile: null,
@@ -45,6 +46,16 @@ export class FrameState {
   croppedSize?: FrameSize;
   isAnamorphic!: boolean;
   realtime!: boolean;
+  /**
+   * Explicit producer policy, separate from `realtime`.
+   *
+   * `realtime` answers "hold this pipeline to wall clock". This answers "do not attach
+   * an input throttle at all". They are different questions, and conflating them meant
+   * the only way to get unpaced production was to answer the realtime question "no" on
+   * behalf of every consumer of that boolean. When this is true the input throttle is
+   * omitted regardless of `realtime`; when false, behaviour is exactly as before.
+   */
+  suppressInputThrottle!: boolean;
   videoFormat!: VideoFormat;
   videoPreset!: Nullable<string>;
   videoProfile!: Nullable<string>;

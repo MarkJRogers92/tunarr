@@ -65,6 +65,14 @@ export type StreamOptions = {
   duration: Duration;
   watermark?: Watermark;
   realtime?: boolean; // = true,
+  /**
+   * Explicit producer policy: omit the input throttle entirely, regardless of
+   * `realtime`. Defaults to false and no caller sets it today - it was enabled for the
+   * HLS producer and reverted, because without a production bound the resulting lead
+   * pushed clients outside the advertised window. Do not enable it until bounded work
+   * units exist; see BasePipelineBuilder.setRealtime().
+   */
+  suppressInputThrottle?: boolean;
   extraInputHeaders?: Record<string, string>;
   outputFormat: OutputFormat;
   ptsOffset?: number;

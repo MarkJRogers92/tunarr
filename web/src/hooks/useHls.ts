@@ -17,7 +17,26 @@ export const useHls = (userConfig?: Partial<HlsConfig>) => {
       fragLoadingTimeOut: 30000,
       initialLiveManifestSize: 3, // About 10 seconds of playback needed before playing
       enableWorker: true,
-      lowLatencyMode: true,
+      // The runway has to outlast the producer's rest, and it is measured.
+      //
+      // This was reverted to the hls.js defaults earlier today, on the reasoning that the
+      // overnight run used them and they were therefore known-good. That reasoning missed
+      // the thing the defaults were being protected by: the producer does not tick
+      // steadily. Measured directly on this channel, the SERVED playlist was completely
+      // static for 41 seconds - media sequence 231, discontinuity sequence 8, unchanged -
+      // and then advanced 33 segments in one step. A viewer's runway is
+      // `liveSyncDurationCount` x targetDuration, so at the default 3 x 4s it is 12
+      // seconds against a 41 second gap: guaranteed starvation, every time the producer
+      // rests. That is the freeze, and it is arithmetic rather than tuning.
+      //
+      // 45 x 4s = 180s of runway against that 41s gap, ~4x margin. `maxBufferLength` is
+      // set above it so the buffer is never the binding limit rather than the runway.
+      // This is a START POSITION, not a claim that 180s of media is downloaded - the
+      // distinction that made an earlier version of this comment wrong.
+      lowLatencyMode: false,
+      liveSyncDurationCount: 45,
+      maxBufferLength: 300,
+      backBufferLength: 30,
       xhrSetup: (xhr) => {
         xhr.setRequestHeader(
           'Access-Control-Allow-Headers',

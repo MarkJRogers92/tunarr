@@ -133,16 +133,34 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       return await this.lock.runExclusive(async () => {
         const playlistLines = await this.readPlaylist();
         if (playlistLines) {
+          const maxSegmentsToKeep = 300;
           const trimResult = this.#hlsPlaylistMutator.trimPlaylist(
             this.#playlistStart!,
             filterOpts,
             playlistLines,
             {
-              // Widened from 20 (~80s) to 75 (~5 minutes). This is the WINDOW the
-              // player can actually fetch, and it is the half of the buffering that
-              // is easy to miss: a deep producer-side buffer is invisible to a client
-              // if the playlist only advertises 80 seconds of it.
-              maxSegmentsToKeep: 75,
+              // Raised to 120 (~8 minutes) to cover the producer's cushion AND a
+              // client's back-buffer at once. Those two have to fit inside the same
+              // window: with the producer running ~75 segments ahead and a 30 segment
+              // back-buffer, a client sits ~105 segments below the head, so a smaller
+              // window cannot reach both the live edge and the client watching it.
+              // RAISED from 120 (~8 min) to 300 (~20 min), and it is KEPT - this is a
+              // load-bearing backstop for an unfixed defect, not spare capacity.
+              //
+              // The unfixed defect: a single transcode job runs for a whole lineup item,
+              // and the 300s admission gate below is checked BETWEEN items, so one job can
+              // be as long as the item - 537s observed, 551s historic maximum. Gate 300s +
+              // one job 551s is a ~850s (14 min) lead ceiling. At 120 segments (480s) the
+              // window cannot reach a client sitting behind that lead; at 300 (1200s) it
+              // can. Do not reduce this to 120 as cleanup until bounded work units exist.
+              //
+              // The +448s lead that motivated this was produced by an experiment (the
+              // throttle override) that has since been reverted. It is history, not the
+              // present state - but the ceiling above is a property of the UNFIXED job
+              // length, which is why the larger window stays.
+              //
+              // Retention follows the floor, so the extra advertised segments stay on disk.
+              maxSegmentsToKeep,
               targetDuration: this.getHlsOptions().hlsTime,
               previousDiscontinuitySequence: this.#lastDiscontinuitySequence,
               endWithDiscontinuity: false,
@@ -151,12 +169,40 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
           this.#lastDiscontinuitySequence = trimResult.discontinuitySequence;
           const now = dayjs();
           if (now.isAfter(this.#lastDelete.add(30, 'seconds'))) {
+            // Delete on a RETENTION bound, never on the served window's start alone.
+            //
+            // The window start is derived from client REQUEST positions
+            // (`minSegmentRequested`, 30 segments behind the most recent request),
+            // so passing it straight through as the deletion threshold lets one
+            // client's position delete media another client is still reading. The
+            // anchor is meant to track the SLOWEST client and protect it; behind a
+            // proxy all clients arrive from one address, so the per-IP map collapses
+            // to whichever client asked last - the opposite of the intent - and a
+            // client that falls behind then requests segments that were just
+            // unlinked. Observed on a live install as a player erroring or skipping
+            // forward at item boundaries while a second client was further back.
+            //
+            // Clamping to `head - maxSegmentsToKeep` keeps the documented design
+            // above (the advertised window must still be able to reach ~300 segments
+            // back for a client sitting behind the producer's lead) while making the
+            // floor a function of PRODUCTION rather than of who asked most recently.
+            // `min` means it can only ever delete FEWER segments than before, so it
+            // cannot regress retention; the floor now advances with the head instead
+            // of jumping when a request moves the anchor.
+            const headSegmentNumber =
+              trimResult.sequence + Math.max(0, trimResult.segmentCount - 1);
+            const retentionFloor = headSegmentNumber + 1 - maxSegmentsToKeep;
+            const deletionThreshold =
+              retentionFloor > 0
+                ? Math.min(trimResult.sequence, retentionFloor)
+                : trimResult.sequence;
             this.logger.debug(
-              'Deleting old segments from stream (channel id = %s, number = %d)',
+              'Deleting old segments from stream (channel id = %s, number = %d, below = %d)',
               this.channel.uuid,
               this.channel.number,
+              deletionThreshold,
             );
-            this.deleteOldSegments(trimResult.sequence).catch((e) =>
+            this.deleteOldSegments(deletionThreshold).catch((e) =>
               this.logger.error(e),
             );
             this.#lastDelete = now;
@@ -266,6 +312,22 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         {
           audioOnly: false,
           realtime,
+          // CONTAINMENT - the throttle override is deliberately NOT set here.
+          //
+          // It was enabled on 2026-09-18 and made playback worse, not better. The reason
+          // is that removing the input throttle lets the producer race far ahead: the
+          // measured lead reached +448s, while the served window is `takeRight` and a
+          // client plays at AIR time, `lead` seconds behind the head. At a 7.5-minute lead
+          // inside an 8-minute window the client sat on the edge and was pushed outside it
+          // as soon as production ran further ahead, at which point its own segments
+          // stopped being advertised and playback errored.
+          //
+          // The missing piece is a production BOUND, not a removed throttle: the job that
+          // overshot was 537 seconds long, because the 300-second between-item gate is not
+          // a within-item limit. Until that bound exists (capped work units with
+          // source-preserving continuation), the producer stays paced. The
+          // `suppressInputThrottle` policy itself is retained, tested and default-off, so
+          // re-enabling it is one line once the bound is in place.
           streamMode: this.sessionType,
         },
       );
@@ -467,7 +529,10 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
 
     // Recorded whether or not anything was deleted: it is the threshold that
     // matters, since everything below it is gone either way.
-    this.#highestDeletedBelow = Math.max(this.#highestDeletedBelow, sequenceNum);
+    this.#highestDeletedBelow = Math.max(
+      this.#highestDeletedBelow,
+      sequenceNum,
+    );
 
     if (segments.length > 0) {
       this.logger.trace(

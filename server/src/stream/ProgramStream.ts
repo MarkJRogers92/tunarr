@@ -140,14 +140,20 @@ export class ProgramStream extends events.EventEmitter<ProgramStreamEvents> {
         details: streamDetails,
       },
       options: {
+        // Spread FIRST, deliberately, so a caller's optional extras cannot silently
+        // override the session's own policy fields below. `opts` carries only
+        // ptsOffset/isFirstTranscode today, so this is dormant - but spread-LAST means any
+        // future `opts` member named `realtime` or `suppressInputThrottle` would win over
+        // the context, which is the opposite of what those fields are for.
+        ...(this.opts ?? {}),
         startTime: start,
         duration: dayjs.duration(lineupItem.streamDuration),
         watermark,
         realtime: this.context.realtime,
+        suppressInputThrottle: this.context.suppressInputThrottle,
         outputFormat: this.outputFormat,
         streamMode: this.context.streamMode,
         encoding: this.context.encoding,
-        ...(this.opts ?? {}),
       },
       lineupItem,
     });

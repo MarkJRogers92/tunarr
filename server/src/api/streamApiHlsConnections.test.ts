@@ -19,6 +19,9 @@ import {
   type ZodTypeProvider,
 } from 'fastify-type-provider-zod';
 import type { DeepRequired } from 'ts-essentials';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../container.js', () => ({ container: { get: vi.fn() } }));
@@ -75,6 +78,7 @@ const baseOptions: BaseHlsSessionOptions = {
 describe('streamApi HLS connection registration (issue #2045 invariant)', () => {
   let session: TestHlsSession;
   let app: ReturnType<typeof Fastify>;
+  let testRoot: string;
   let sessionManager: {
     getOrCreateHlsSession: ReturnType<typeof vi.fn>;
     getHlsSession: ReturnType<typeof vi.fn>;
@@ -84,7 +88,16 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
   beforeEach(async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
 
-    session = new TestHlsSession(makeChannel(), baseOptions);
+    testRoot = await mkdtemp(join(tmpdir(), 'tunarr-stream-api-'));
+    session = new TestHlsSession(makeChannel(), {
+      ...baseOptions,
+      transcodeDirectory: testRoot,
+    });
+    await mkdir(session.workingDirectory, { recursive: true });
+    await Promise.all([
+      writeFile(join(session.workingDirectory, 'data000010.ts'), 'segment 10'),
+      writeFile(join(session.workingDirectory, 'data000100.ts'), 'segment 100'),
+    ]);
     sessionManager = {
       getOrCreateHlsSession: vi.fn(async (_id: string, token: string) => {
         // Mirror SessionManager.getOrCreateSession: addConnection(token, ...)
@@ -119,6 +132,7 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
   afterEach(async () => {
     vi.useRealTimers();
     await app.close();
+    await rm(testRoot, { recursive: true, force: true });
   });
 
   it('master playlist handshake registers the connection under the client IP', async () => {

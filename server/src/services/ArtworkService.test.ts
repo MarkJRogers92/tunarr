@@ -2,6 +2,8 @@ import type { IProgramDB } from '@/db/interfaces/IProgramDB.js';
 import type { MediaSourceId } from '@/db/schema/base.js';
 import type { DrizzleDBAccess } from '@/db/schema/index.js';
 import type { FastifyReply } from 'fastify';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
 import type { MediaSourceDB } from '../db/mediaSourceDB.ts';
 import type { Artwork } from '../db/schema/Artwork.ts';
@@ -90,6 +92,18 @@ describe('ArtworkService', () => {
 
   describe('serveArtwork', () => {
     it('never redirects a credentialed URL, even with proxyArtwork disabled', async () => {
+      let receivedToken: string | undefined;
+      const upstream = createServer((request, response) => {
+        receivedToken = request.headers['x-plex-token'] as string | undefined;
+        response.setHeader('content-type', 'image/png');
+        response.setHeader('connection', 'close');
+        response.end('image bytes');
+      });
+      await new Promise<void>((resolve) =>
+        upstream.listen(0, '127.0.0.1', resolve),
+      );
+      const { port } = upstream.address() as AddressInfo;
+
       const redirect = vi.fn();
       const reply = {
         redirect,
@@ -98,18 +112,26 @@ describe('ArtworkService', () => {
         send: vi.fn().mockReturnThis(),
       } as unknown as FastifyReply;
 
-      await makeService('plex').serveArtwork(
-        {
-          kind: 'url',
-          url: SOURCE_PATH,
-          headers: { 'X-Plex-Token': ACCESS_TOKEN },
-        },
-        reply,
-      );
+      try {
+        await makeService('plex').serveArtwork(
+          {
+            kind: 'url',
+            url: `http://127.0.0.1:${port}/artwork`,
+            headers: { 'X-Plex-Token': ACCESS_TOKEN },
+          },
+          reply,
+        );
+      } finally {
+        upstream.closeAllConnections();
+        await new Promise<void>((resolve, reject) =>
+          upstream.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
 
       // A redirect would put the token in the Location header, readable by any
       // unauthenticated caller. See GHSA-h3r4-r2f2-qf59 against ErsatzTV.
       expect(redirect).not.toHaveBeenCalled();
+      expect(receivedToken).toBe(ACCESS_TOKEN);
     });
 
     it('still redirects a credential-free URL when proxyArtwork is disabled', async () => {

@@ -310,6 +310,7 @@ export class FfmpegStreamFactory {
       encoding,
       isFirstTranscode,
       emitEndList,
+      suppressInputThrottle,
     },
     lineupItem,
   }: StreamSessionCreateArgs): Promise<Maybe<TranscodeSessionResult>> {
@@ -454,6 +455,7 @@ export class FfmpegStreamFactory {
           ? 90000
           : playbackParams!.videoTrackTimeScale,
         realtime,
+        suppressInputThrottle: suppressInputThrottle ?? false,
         videoFormat: isPassthrough
           ? VideoFormats.Copy
           : playbackParams!.videoFormat,
