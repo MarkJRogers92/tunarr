@@ -1,5 +1,9 @@
 import type { ISettingsDB } from '@/db/interfaces/ISettingsDB.js';
 import type { ChannelOrmWithTranscodeConfig } from '@/db/schema/derivedTypes.js';
+import {
+  isContentBackedLineupItem,
+  type StreamLineupItem,
+} from '@/db/derived_types/StreamLineup.js';
 import type { FfmpegTranscodeSession } from '@/ffmpeg/FfmpegTrancodeSession.js';
 import { GetLastPtsDurationTask } from '@/ffmpeg/GetLastPtsDuration.js';
 import type { HlsOptions } from '@/ffmpeg/builder/constants.js';
@@ -47,13 +51,52 @@ export interface HlsSessionOptions extends BaseHlsSessionOptions {
   streamMode: 'hls' | 'hls_direct_v2';
 }
 
-/**
- * Each HLS ffmpeg process timestamps its first segment from the current wall
- * clock. If a preceding process runs faster than realtime, it can write several
- * minutes into the future; the next process then moves PROGRAM-DATE-TIME
- * backwards and clients such as TiviMate stall. Keep every production job
- * paced until timestamp continuity can be preserved independently of wall time.
- */
+export const HLS_CATCH_UP_ENTER_SECONDS = 60;
+export const HLS_CATCH_UP_EXIT_SECONDS = 90;
+export const HLS_CATCH_UP_WORK_UNIT_MS = 30_000;
+
+export type HlsProducerWorkDecision = {
+  catchingUp: boolean;
+  maxWorkDurationMs: number | undefined;
+};
+
+export function decideHlsProducerWork(
+  reserveSeconds: number,
+  wasCatchingUp: boolean,
+  streamMode: HlsSessionOptions['streamMode'],
+): HlsProducerWorkDecision {
+  if (!Number.isFinite(reserveSeconds) || streamMode !== 'hls') {
+    return { catchingUp: false, maxWorkDurationMs: undefined };
+  }
+  const catchingUp = wasCatchingUp
+    ? reserveSeconds < HLS_CATCH_UP_EXIT_SECONDS
+    : reserveSeconds < HLS_CATCH_UP_ENTER_SECONDS;
+  return {
+    catchingUp,
+    maxWorkDurationMs: catchingUp ? HLS_CATCH_UP_WORK_UNIT_MS : undefined,
+  };
+}
+
+export function prepareHlsProducerItem(
+  item: StreamLineupItem,
+  decision: HlsProducerWorkDecision,
+): { lineupItem: StreamLineupItem; suppressInputThrottle: boolean } {
+  if (
+    !decision.catchingUp ||
+    decision.maxWorkDurationMs === undefined ||
+    !isContentBackedLineupItem(item)
+  ) {
+    return { lineupItem: item, suppressInputThrottle: false };
+  }
+  return {
+    lineupItem: {
+      ...item,
+      streamDuration: Math.min(item.streamDuration, decision.maxWorkDurationMs),
+    },
+    suppressInputThrottle: true,
+  };
+}
+
 export function shouldPaceHlsTranscode(
   _transcodeBufferSeconds: number,
 ): boolean {
