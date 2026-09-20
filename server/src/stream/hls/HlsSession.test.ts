@@ -12,6 +12,7 @@ import tmp from 'tmp';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { ProgramStream } from '../ProgramStream.ts';
 import {
+  applyHlsInvalidReserveWarning,
   applyHlsProducerDecision,
   createHlsProducerPlayerContext,
   decideHlsProducerWork,
@@ -86,6 +87,24 @@ function makeSession(transcodeDirectory: string): HlsSession {
 }
 describe('HlsSession', () => {
   describe('bounded producer policy', () => {
+    test('re-arms invalid reserve warnings after a finite reserve above admission', () => {
+      const firstInvalid = applyHlsInvalidReserveWarning(false, Number.NaN);
+      expect(firstInvalid.shouldWarn).toBe(true);
+
+      const finiteReserve = applyHlsInvalidReserveWarning(
+        firstInvalid.warningActive,
+        301,
+      );
+      expect(finiteReserve.shouldWarn).toBe(false);
+      expect(finiteReserve.warningActive).toBe(false);
+
+      const secondInvalid = applyHlsInvalidReserveWarning(
+        finiteReserve.warningActive,
+        Number.NaN,
+      );
+      expect(secondInvalid.shouldWarn).toBe(true);
+    });
+
     test('reports only catch-up state transitions', () => {
       expect(applyHlsProducerDecision(false, 40, 'hls').transition).toBe(
         'entered',

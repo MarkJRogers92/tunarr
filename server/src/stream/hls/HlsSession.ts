@@ -121,6 +121,17 @@ export function applyHlsProducerDecision(
   return transition === undefined ? decision : { ...decision, transition };
 }
 
+export function applyHlsInvalidReserveWarning(
+  warningActive: boolean,
+  reserveSeconds: number,
+): { shouldWarn: boolean; warningActive: boolean } {
+  const invalidReserve = !Number.isFinite(reserveSeconds);
+  return {
+    shouldWarn: invalidReserve && !warningActive,
+    warningActive: invalidReserve,
+  };
+}
+
 export function createHlsProducerPlayerContext(
   result: CurrentLineupItemResult,
   transcodeConfig: ChannelOrmWithTranscodeConfig['transcodeConfig'],
@@ -337,18 +348,20 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       const transcodeBuffer = dayjs
         .duration(dayjs(this.transcodedUntil).diff())
         .asSeconds();
+      const invalidReserveWarning = applyHlsInvalidReserveWarning(
+        this.#invalidReserveWarningActive,
+        transcodeBuffer,
+      );
+      if (invalidReserveWarning.shouldWarn) {
+        this.logger.warn(
+          'HLS producer reserve is invalid; falling back to paced work (channel=%s, reserve=%s)',
+          this.channel.uuid,
+          transcodeBuffer,
+        );
+      }
+      this.#invalidReserveWarningActive = invalidReserveWarning.warningActive;
 
       if (!Number.isFinite(transcodeBuffer) || transcodeBuffer <= 300) {
-        const invalidReserve = !Number.isFinite(transcodeBuffer);
-        if (invalidReserve && !this.#invalidReserveWarningActive) {
-          this.logger.warn(
-            'HLS producer reserve is invalid; falling back to paced work (channel=%s, reserve=%s)',
-            this.channel.uuid,
-            transcodeBuffer,
-          );
-        }
-        this.#invalidReserveWarningActive = invalidReserve;
-
         const decision = applyHlsProducerDecision(
           this.#catchingUp,
           transcodeBuffer,
