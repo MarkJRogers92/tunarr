@@ -43,6 +43,10 @@ export abstract class BaseHlsSession<
     return minBy([...this._minByIp.entries()], ([_, seg]) => seg)?.[1] ?? 0;
   }
 
+  public hasSegmentPosition(clientIp: string): boolean {
+    return this._minByIp.has(clientIp);
+  }
+
   constructor(
     channel: ChannelOrmWithTranscodeConfig,
     options: HlsSessionOptsT,

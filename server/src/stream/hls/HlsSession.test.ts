@@ -15,8 +15,10 @@ import {
   applyHlsInvalidReserveWarning,
   applyHlsProducerDecision,
   createHlsProducerPlayerContext,
+  decideHlsProducerCycle,
   decideHlsProducerWork,
   HlsSession,
+  normalizeHlsProducerClock,
   prepareHlsProducerItem,
 } from './HlsSession.js';
 
@@ -56,7 +58,10 @@ function contentItem(
     startOffset,
     programBeginMs: 0,
     infiniteLoop: false,
-    program: {},
+    program: {
+      uuid: 'program-uuid',
+      persisted: { externalSourceId: 'source-id' },
+    },
     ...(type === 'commercial' ? { fillerListId: 'filler' } : {}),
   } as unknown as StreamLineupItem;
 }
@@ -87,6 +92,111 @@ function makeSession(transcodeDirectory: string): HlsSession {
 }
 describe('HlsSession', () => {
   describe('bounded producer policy', () => {
+    test('re-anchors an invalid clock and forces its recovery work to stay paced', () => {
+      const now = new Date('2026-09-19T20:00:00.000-05:00');
+      const recovered = normalizeHlsProducerClock(new Date(Number.NaN), now);
+
+      expect(recovered.recoveredInvalidClock).toBe(true);
+      expect(Number.isFinite(recovered.reserveSeconds)).toBe(true);
+      expect(recovered.reserveSeconds).toBe(0);
+      expect(recovered.transcodedUntil.valueOf()).toBe(now.valueOf());
+
+      const cycle = decideHlsProducerCycle({
+        reserveSeconds: recovered.reserveSeconds,
+        recoveredInvalidClock: recovered.recoveredInvalidClock,
+        wasCatchingUp: true,
+        streamMode: 'hls',
+        hasSegmentAnchor: true,
+        startupProducedMs: 0,
+        initialSegmentCount: 2,
+        segmentDurationSeconds: 4,
+      });
+      expect(cycle).toMatchObject({
+        type: 'produce',
+        decision: {
+          catchingUp: false,
+          maxWorkDurationMs: undefined,
+        },
+      });
+    });
+
+    test('paces one bounded startup window, then waits for a real segment anchor', () => {
+      const initial = decideHlsProducerCycle({
+        reserveSeconds: 0,
+        recoveredInvalidClock: false,
+        wasCatchingUp: false,
+        streamMode: 'hls',
+        hasSegmentAnchor: false,
+        startupProducedMs: 0,
+        initialSegmentCount: 2,
+        segmentDurationSeconds: 4,
+      });
+      expect(initial).toEqual({
+        type: 'produce',
+        decision: { catchingUp: false, maxWorkDurationMs: 8_000 },
+      });
+
+      const waiting = decideHlsProducerCycle({
+        reserveSeconds: 0,
+        recoveredInvalidClock: false,
+        wasCatchingUp: false,
+        streamMode: 'hls',
+        hasSegmentAnchor: false,
+        startupProducedMs: 8_000,
+        initialSegmentCount: 2,
+        segmentDurationSeconds: 4,
+      });
+      expect(waiting).toEqual({ type: 'wait_for_segment_anchor' });
+      expect(
+        decideHlsProducerCycle({
+          reserveSeconds: 0,
+          recoveredInvalidClock: false,
+          wasCatchingUp: false,
+          streamMode: 'hls',
+          hasSegmentAnchor: false,
+          startupProducedMs: 12_000,
+          initialSegmentCount: 2,
+          segmentDurationSeconds: 4,
+        }),
+      ).toEqual({ type: 'wait_for_segment_anchor' });
+    });
+
+    test('uses normal catch-up policy after the first segment anchor exists', () => {
+      expect(
+        decideHlsProducerCycle({
+          reserveSeconds: 8,
+          recoveredInvalidClock: false,
+          wasCatchingUp: false,
+          streamMode: 'hls',
+          hasSegmentAnchor: true,
+          startupProducedMs: 8_000,
+          initialSegmentCount: 2,
+          segmentDurationSeconds: 4,
+        }),
+      ).toMatchObject({
+        type: 'produce',
+        decision: { catchingUp: true, maxWorkDurationMs: 30_000 },
+      });
+    });
+
+    test('does not apply the startup hold to hls_direct_v2', () => {
+      expect(
+        decideHlsProducerCycle({
+          reserveSeconds: 0,
+          recoveredInvalidClock: false,
+          wasCatchingUp: false,
+          streamMode: 'hls_direct_v2',
+          hasSegmentAnchor: false,
+          startupProducedMs: 0,
+          initialSegmentCount: 2,
+          segmentDurationSeconds: 4,
+        }),
+      ).toEqual({
+        type: 'produce',
+        decision: { catchingUp: false, maxWorkDurationMs: undefined },
+      });
+    });
+
     test('re-arms invalid reserve warnings after a finite reserve above admission', () => {
       const firstInvalid = applyHlsInvalidReserveWarning(false, Number.NaN);
       expect(firstInvalid.shouldWarn).toBe(true);
@@ -109,7 +219,9 @@ describe('HlsSession', () => {
       expect(applyHlsProducerDecision(false, 40, 'hls').transition).toBe(
         'entered',
       );
-      expect(applyHlsProducerDecision(true, 70, 'hls').transition).toBeUndefined();
+      expect(
+        applyHlsProducerDecision(true, 70, 'hls').transition,
+      ).toBeUndefined();
       expect(applyHlsProducerDecision(true, 90, 'hls').transition).toBe(
         'exited',
       );
@@ -203,6 +315,7 @@ describe('HlsSession', () => {
       'caps %s without changing its source offset',
       (type) => {
         const original = contentItem(type, 120_000);
+        const originalProgram = original.program;
         const prepared = prepareHlsProducerItem(original, {
           catchingUp: true,
           maxWorkDurationMs: 30_000,
@@ -211,6 +324,13 @@ describe('HlsSession', () => {
         expect(prepared.lineupItem.streamDuration).toBe(30_000);
         expect(prepared.lineupItem.startOffset).toBe(480_000);
         expect(original.streamDuration).toBe(120_000);
+        expect(prepared.lineupItem.duration).toBe(1_320_000);
+        expect(prepared.lineupItem.programBeginMs).toBe(0);
+        expect(prepared.lineupItem.program).toBe(originalProgram);
+        expect(prepared.lineupItem.program).toMatchObject({
+          uuid: 'program-uuid',
+          persisted: { externalSourceId: 'source-id' },
+        });
         expect(prepared.suppressInputThrottle).toBe(true);
       },
     );
@@ -231,6 +351,17 @@ describe('HlsSession', () => {
           maxWorkDurationMs: undefined,
         }),
       ).toEqual({ lineupItem: original, suppressInputThrottle: false });
+    });
+
+    test('bounds a paced startup item without suppressing input throttling', () => {
+      const original = contentItem('program', 120_000);
+      const prepared = prepareHlsProducerItem(original, {
+        catchingUp: false,
+        maxWorkDurationMs: 8_000,
+      });
+
+      expect(prepared.lineupItem.streamDuration).toBe(8_000);
+      expect(prepared.suppressInputThrottle).toBe(false);
     });
 
     test.each(['offline', 'error', 'redirect'] as const)(

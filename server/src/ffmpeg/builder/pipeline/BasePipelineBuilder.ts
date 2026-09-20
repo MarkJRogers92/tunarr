@@ -892,16 +892,9 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
     // production below realtime and the producer's lead drains until a client starves.
     // Without it the same input has 15x of margin.
     //
-    // NO CALLER SETS THIS POLICY TODAY. It was enabled for the HLS producer on
-    // 2026-09-18 and reverted the same evening, because removing the throttle let the
-    // producer race to a +448s lead while the served window was 8 minutes: a client plays
-    // at AIR time, `lead` seconds behind the head, so it was pushed outside the window and
-    // its own segments stopped being advertised. The missing piece is a PRODUCTION BOUND
-    // (capped work units with source-preserving continuation), not a removed throttle -
-    // one job could still run 551 seconds because the 300s gate is checked BETWEEN items.
-    //
-    // DO NOT RE-ENABLE until that bound exists. The mechanism is kept, tested and
-    // default-off so it is one line when the bound lands.
+    // Standard HLS now enables this only for content-backed catch-up units capped at
+    // 30 seconds. Paced startup, invalid-clock recovery, placeholders, and other stream
+    // modes retain the default input throttle.
     if (this.desiredState.suppressInputThrottle) return;
     if (!this.desiredState.realtime) return;
     const option = new ReadrateInputOption(this.ffmpegCapabilities, 0);

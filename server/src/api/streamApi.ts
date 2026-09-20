@@ -311,7 +311,11 @@ export const streamApi: RouterPluginAsyncCallback = async (fastify) => {
         (req.params.sessionType === 'hls' ||
           req.params.sessionType === 'hls_direct_v2')
       ) {
-        const playlistResult = await (session as HlsSession).trimPlaylist();
+        const hlsSession = session as HlsSession;
+        const playlistResult =
+          req.params.sessionType === 'hls'
+            ? await hlsSession.trimPlaylistForClient(req.ip)
+            : await hlsSession.trimPlaylist();
         if (playlistResult.isFailure()) {
           logger.error(playlistResult.error);
           return res.status(500).send('Error retrieving variant playlist');

@@ -319,6 +319,13 @@ describe('HlsPlaylistMutator', () => {
         '#EXTINF:4.000000,',
         '#EXT-X-PROGRAM-DATE-TIME:2026-09-19T19:59:34.000-0500',
         '/stream/channels/test/hls/data000002.ts',
+        '#EXT-X-DISCONTINUITY',
+        '#EXTINF:4.000000,',
+        '#EXT-X-PROGRAM-DATE-TIME:2026-09-19T19:58:00.000-0500',
+        '/stream/channels/test/hls/data000003.ts',
+        '#EXTINF:4.000000,',
+        '#EXT-X-PROGRAM-DATE-TIME:2026-09-19T19:58:04.000-0500',
+        '/stream/channels/test/hls/data000004.ts',
       ];
       const result = mutator.trimPlaylist(
         start,
@@ -335,7 +342,43 @@ describe('HlsPlaylistMutator', () => {
         start.valueOf(),
         start.add(4, 'seconds').valueOf(),
         start.add(8, 'seconds').valueOf(),
+        start.add(12, 'seconds').valueOf(),
+        start.add(16, 'seconds').valueOf(),
       ]);
+    });
+
+    it('ends a pre-anchor playlist at scheduled wall time', () => {
+      const start = dayjs('2026-09-19T20:00:00.000-0500');
+      const result = mutator.trimPlaylist(
+        start,
+        {
+          type: 'through_date',
+          through: start.add(9, 'seconds'),
+          segmentFloor: 1,
+        },
+        createPlaylist(6),
+        defaultOpts,
+      );
+
+      expect(result.playlist).not.toContain('data000000.ts');
+      expect(result.playlist).toContain('data000001.ts');
+      expect(result.playlist).toContain('data000002.ts');
+      expect(result.playlist).not.toContain('data000003.ts');
+      expect(result.sequence).toBe(1);
+      expect(result.segmentCount).toBe(2);
+    });
+
+    it('does not fall forward to future segments when scheduled content is unavailable', () => {
+      const start = dayjs('2026-09-19T20:00:00.000-0500');
+      const result = mutator.trimPlaylist(
+        start,
+        { type: 'through_date', through: start.subtract(1, 'second') },
+        createPlaylist(3),
+        defaultOpts,
+      );
+
+      expect(result.segmentCount).toBe(0);
+      expect(result.playlist).not.toContain('data000000.ts');
     });
 
     it('should return correct playlistStart time', () => {

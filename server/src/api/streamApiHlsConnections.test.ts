@@ -31,6 +31,10 @@ import { streamApi } from './streamApi.js';
 
 class TestHlsSession extends BaseHlsSession {
   public readonly sessionType = 'hls' as const;
+  public readonly playlistRequests: Array<{
+    clientIp: string;
+    hasSegmentAnchor: boolean;
+  }> = [];
 
   get minByIp() {
     return new Map(this._minByIp);
@@ -42,6 +46,20 @@ class TestHlsSession extends BaseHlsSession {
 
   async getMasterPlaylist() {
     return Result.success<string | undefined>('#EXTM3U\n');
+  }
+
+  async trimPlaylistForClient(clientIp: string) {
+    const hasSegmentAnchor = this.hasSegmentPosition(clientIp);
+    this.playlistRequests.push({ clientIp, hasSegmentAnchor });
+    return Result.success({
+      playlistStart: new Date(),
+      sequence: hasSegmentAnchor ? 100 : 10,
+      playlist: hasSegmentAnchor
+        ? '#EXTM3U\n#NORMAL-HEAD'
+        : '#EXTM3U\n#SCHEDULED',
+      segmentCount: 1,
+      discontinuitySequence: 0,
+    });
   }
 
   protected getHlsOptions(): DeepRequired<HlsOptions> {
@@ -184,5 +202,59 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
     expect(session.connections()).not.toHaveProperty('203.0.113.20');
     expect(session.minByIp.has('203.0.113.20')).toBe(false);
     expect(session.minSegment).toBe(100);
+  });
+
+  it('keeps initial and late-joining clients at scheduled time until their first existing segment request', async () => {
+    const initialPoll = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+      remoteAddress: '203.0.113.10',
+    });
+    const repeatedPoll = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(initialPoll.body).toContain('#SCHEDULED');
+    expect(repeatedPoll.body).toContain('#SCHEDULED');
+
+    await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/data000100.ts`,
+      remoteAddress: '203.0.113.10',
+    });
+    const anchoredPoll = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(anchoredPoll.body).toContain('#NORMAL-HEAD');
+
+    const lateJoinerPoll = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+      remoteAddress: '203.0.113.20',
+    });
+    expect(lateJoinerPoll.body).toContain('#SCHEDULED');
+
+    await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/data000010.ts`,
+      remoteAddress: '203.0.113.20',
+    });
+    const lateJoinerAnchoredPoll = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+      remoteAddress: '203.0.113.20',
+    });
+    expect(lateJoinerAnchoredPoll.body).toContain('#NORMAL-HEAD');
+
+    expect(session.playlistRequests).toEqual([
+      { clientIp: '203.0.113.10', hasSegmentAnchor: false },
+      { clientIp: '203.0.113.10', hasSegmentAnchor: false },
+      { clientIp: '203.0.113.10', hasSegmentAnchor: true },
+      { clientIp: '203.0.113.20', hasSegmentAnchor: false },
+      { clientIp: '203.0.113.20', hasSegmentAnchor: true },
+    ]);
   });
 });

@@ -79,9 +79,8 @@ export type PlayerContextStreamSettings = {
   /**
    * Explicit producer policy: omit the input throttle regardless of `realtime`.
    *
-   * Defaults false and NO caller sets it today - it was tried for the HLS producer and
-   * reverted. Do not set it until bounded work units exist; see
-   * BasePipelineBuilder.setRealtime(). Optional, so existing callers are unchanged.
+   * Defaults false. Standard HLS sets it only for bounded, content-backed catch-up
+   * work. Optional, so existing callers are unchanged.
    */
   suppressInputThrottle?: boolean;
   streamMode: ChannelStreamMode;

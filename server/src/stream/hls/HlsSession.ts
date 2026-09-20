@@ -65,6 +65,51 @@ export type HlsProducerWorkDecision = {
 
 export type HlsProducerTransition = 'entered' | 'exited';
 
+export type HlsProducerCycleDecision =
+  | { type: 'wait_for_segment_anchor' }
+  | {
+      type: 'produce';
+      decision: HlsProducerWorkDecision & {
+        transition?: HlsProducerTransition;
+      };
+    };
+
+export type HlsProducerCycleInput = {
+  reserveSeconds: number;
+  recoveredInvalidClock: boolean;
+  wasCatchingUp: boolean;
+  streamMode: HlsSessionOptions['streamMode'];
+  hasSegmentAnchor: boolean;
+  startupProducedMs: number;
+  initialSegmentCount: number;
+  segmentDurationSeconds: number;
+};
+
+export function normalizeHlsProducerClock(
+  transcodedUntil: Dayjs | Date | undefined,
+  now: Dayjs | Date,
+): {
+  transcodedUntil: Dayjs;
+  reserveSeconds: number;
+  recoveredInvalidClock: boolean;
+} {
+  const nowTime = dayjs(now);
+  const candidate = dayjs(transcodedUntil);
+  const reserveSeconds = dayjs.duration(candidate.diff(nowTime)).asSeconds();
+  if (candidate.isValid() && Number.isFinite(reserveSeconds)) {
+    return {
+      transcodedUntil: candidate,
+      reserveSeconds,
+      recoveredInvalidClock: false,
+    };
+  }
+  return {
+    transcodedUntil: nowTime,
+    reserveSeconds: 0,
+    recoveredInvalidClock: true,
+  };
+}
+
 export function decideHlsProducerWork(
   reserveSeconds: number,
   wasCatchingUp: boolean,
@@ -87,9 +132,8 @@ export function prepareHlsProducerItem(
   decision: HlsProducerWorkDecision,
 ): { lineupItem: StreamLineupItem; suppressInputThrottle: boolean } {
   if (
-    !decision.catchingUp ||
     decision.maxWorkDurationMs === undefined ||
-    !isContentBackedLineupItem(item)
+    (decision.catchingUp && !isContentBackedLineupItem(item))
   ) {
     return { lineupItem: item, suppressInputThrottle: false };
   }
@@ -98,7 +142,8 @@ export function prepareHlsProducerItem(
       ...item,
       streamDuration: Math.min(item.streamDuration, decision.maxWorkDurationMs),
     },
-    suppressInputThrottle: true,
+    suppressInputThrottle:
+      decision.catchingUp && isContentBackedLineupItem(item),
   };
 }
 
@@ -119,6 +164,60 @@ export function applyHlsProducerDecision(
         ? 'entered'
         : 'exited';
   return transition === undefined ? decision : { ...decision, transition };
+}
+
+export function decideHlsProducerCycle(
+  input: HlsProducerCycleInput,
+): HlsProducerCycleDecision {
+  if (input.streamMode !== 'hls') {
+    return {
+      type: 'produce',
+      decision: applyHlsProducerDecision(
+        input.wasCatchingUp,
+        input.reserveSeconds,
+        input.streamMode,
+      ),
+    };
+  }
+
+  if (!input.hasSegmentAnchor) {
+    const startupWindowSeconds =
+      input.initialSegmentCount * input.segmentDurationSeconds;
+    const remainingStartupMs =
+      startupWindowSeconds * 1_000 - input.startupProducedMs;
+    if (remainingStartupMs <= 0) {
+      return { type: 'wait_for_segment_anchor' };
+    }
+    return {
+      type: 'produce',
+      decision: {
+        catchingUp: false,
+        maxWorkDurationMs: remainingStartupMs,
+      },
+    };
+  }
+
+  if (input.recoveredInvalidClock) {
+    return {
+      type: 'produce',
+      decision: input.wasCatchingUp
+        ? {
+            catchingUp: false,
+            maxWorkDurationMs: undefined,
+            transition: 'exited',
+          }
+        : { catchingUp: false, maxWorkDurationMs: undefined },
+    };
+  }
+
+  return {
+    type: 'produce',
+    decision: applyHlsProducerDecision(
+      input.wasCatchingUp,
+      input.reserveSeconds,
+      input.streamMode,
+    ),
+  };
 }
 
 export function applyHlsInvalidReserveWarning(
@@ -175,6 +274,8 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   #currentAudioRenditions: AudioRenditionInfo[] = [];
   #catchingUp = false;
   #invalidReserveWarningActive = false;
+  #segmentAnchorEstablished = false;
+  #startupProducedMs = 0;
 
   constructor(
     channel: ChannelOrmWithTranscodeConfig,
@@ -189,6 +290,13 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
 
   public get sessionType(): HlsSessionOptions['streamMode'] {
     return this.sessionOptions.streamMode;
+  }
+
+  override onSegmentRequested(clientIp: string, filename: string) {
+    super.onSegmentRequested(clientIp, filename);
+    if (this.hasSegmentPosition(clientIp)) {
+      this.#segmentAnchorEstablished = true;
+    }
   }
 
   async getPlaylist() {
@@ -253,19 +361,11 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
               // back-buffer, a client sits ~105 segments below the head, so a smaller
               // window cannot reach both the live edge and the client watching it.
               // RAISED from 120 (~8 min) to 300 (~20 min), and it is KEPT - this is a
-              // load-bearing backstop for an unfixed defect, not spare capacity.
+              // load-bearing retention backstop, not spare capacity.
               //
-              // The unfixed defect: a single transcode job runs for a whole lineup item,
-              // and the 300s admission gate below is checked BETWEEN items, so one job can
-              // be as long as the item - 537s observed, 551s historic maximum. Gate 300s +
-              // one job 551s is a ~850s (14 min) lead ceiling. At 120 segments (480s) the
-              // window cannot reach a client sitting behind that lead; at 300 (1200s) it
-              // can. Do not reduce this to 120 as cleanup until bounded work units exist.
-              //
-              // The +448s lead that motivated this was produced by an experiment (the
-              // throttle override) that has since been reverted. It is history, not the
-              // present state - but the ceiling above is a property of the UNFIXED job
-              // length, which is why the larger window stays.
+              // Bounded catch-up now limits each unpaced job to 30 seconds, but the
+              // larger served/retained window stays unchanged until sustained live
+              // playback evidence justifies a separate reduction.
               //
               // Retention follows the floor, so the extra advertised segments stay on disk.
               maxSegmentsToKeep,
@@ -328,6 +428,17 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     });
   }
 
+  async trimPlaylistForClient(clientIp: string, scheduledTime = dayjs()) {
+    if (this.hasSegmentPosition(clientIp)) {
+      return this.trimPlaylist();
+    }
+    return this.trimPlaylist({
+      type: 'through_date',
+      through: scheduledTime,
+      segmentFloor: this.#highestDeletedBelow,
+    });
+  }
+
   protected async startInternal() {
     if (this.state === 'started') {
       return;
@@ -339,50 +450,70 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     this.#playlistStart = this.transcodedUntil = dayjs();
     this.#catchingUp = false;
     this.#invalidReserveWarningActive = false;
+    this.#segmentAnchorEstablished = false;
+    this.#startupProducedMs = 0;
     // Fire-and-forget
     this.run().catch((e) => this.logger.error(e));
   }
 
   private async run() {
     while (this.state === 'started') {
-      const transcodeBuffer = dayjs
+      const observedTranscodeBuffer = dayjs
         .duration(dayjs(this.transcodedUntil).diff())
         .asSeconds();
+      const producerClock = normalizeHlsProducerClock(
+        this.transcodedUntil,
+        dayjs(),
+      );
+      if (producerClock.recoveredInvalidClock) {
+        this.transcodedUntil = producerClock.transcodedUntil;
+      }
       const invalidReserveWarning = applyHlsInvalidReserveWarning(
         this.#invalidReserveWarningActive,
-        transcodeBuffer,
+        observedTranscodeBuffer,
       );
       if (invalidReserveWarning.shouldWarn) {
         this.logger.warn(
           'HLS producer reserve is invalid; falling back to paced work (channel=%s, reserve=%s)',
           this.channel.uuid,
-          transcodeBuffer,
+          observedTranscodeBuffer,
         );
       }
       this.#invalidReserveWarningActive = invalidReserveWarning.warningActive;
 
-      if (!Number.isFinite(transcodeBuffer) || transcodeBuffer <= 300) {
-        const decision = applyHlsProducerDecision(
-          this.#catchingUp,
-          transcodeBuffer,
-          this.sessionType,
-        );
+      const producerCycle = decideHlsProducerCycle({
+        reserveSeconds: producerClock.reserveSeconds,
+        recoveredInvalidClock: producerClock.recoveredInvalidClock,
+        wasCatchingUp: this.#catchingUp,
+        streamMode: this.sessionType,
+        hasSegmentAnchor: this.#segmentAnchorEstablished,
+        startupProducedMs: this.#startupProducedMs,
+        initialSegmentCount: this.sessionOptions.initialSegmentCount,
+        segmentDurationSeconds: this.getHlsOptions().hlsTime,
+      });
+      if (producerCycle.type === 'wait_for_segment_anchor') {
+        await wait(dayjs.duration({ seconds: 1 }));
+        continue;
+      }
+
+      if (producerClock.reserveSeconds <= 300) {
+        const { decision } = producerCycle;
         this.#catchingUp = decision.catchingUp;
         if (decision.transition !== undefined) {
           this.logger.info(
             'HLS producer catch-up %s (channel=%s, reserve=%d seconds, target=%d seconds)',
             decision.transition,
             this.channel.uuid,
-            transcodeBuffer,
+            producerClock.reserveSeconds,
             HLS_CATCH_UP_EXIT_SECONDS,
           );
         }
         this.logger.trace(
           'Transcode buffer is %d. Starting next transcode (catching up = %s)',
-          transcodeBuffer,
+          producerClock.reserveSeconds,
           decision.catchingUp,
         );
-        await this.transcode(decision);
+        await this.transcode(decision, !this.#segmentAnchorEstablished);
         this.#isFirstTranscode = false;
       } else {
         // trim and delete
@@ -412,7 +543,10 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     }
   }
 
-  private async transcode(decision: HlsProducerWorkDecision) {
+  private async transcode(
+    decision: HlsProducerWorkDecision,
+    countTowardStartup: boolean,
+  ) {
     const ptsOffset =
       this.#isFirstTranscode ||
       this.sessionOptions.streamMode === 'hls_direct_v2'
@@ -481,6 +615,10 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       }
 
       transcodeSessionResult.forEach((transcodeSession) => {
+        if (countTowardStartup) {
+          this.#startupProducedMs +=
+            transcodeSession.streamDuration.asMilliseconds();
+        }
         this.transcodedUntil = (this.transcodedUntil ?? dayjs()).add(
           transcodeSession.streamDuration,
         );

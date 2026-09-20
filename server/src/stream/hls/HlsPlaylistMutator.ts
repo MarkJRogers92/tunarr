@@ -43,9 +43,16 @@ type FilterBeforeSegmentNumber = {
   segmentFloor?: number;
 };
 
+type FilterThroughDate = {
+  type: 'through_date';
+  through: Dayjs;
+  segmentFloor?: number;
+};
+
 export type HlsPlaylistFilterOptions =
   | FilterBeforeDate
-  | FilterBeforeSegmentNumber;
+  | FilterBeforeSegmentNumber
+  | FilterThroughDate;
 
 /**
  * How far behind the producer's head to end the advertised playlist.
@@ -225,9 +232,9 @@ export class HlsPlaylistMutator {
     };
 
     const physicalFloor =
-      filterOptions.type === 'before_segment_number'
-        ? (filterOptions.segmentFloor ?? 0)
-        : 0;
+      filterOptions.type === 'before_date'
+        ? 0
+        : (filterOptions.segmentFloor ?? 0);
     const eligible =
       physicalFloor > 0
         ? filter(allSegments, (segment) => {
@@ -255,6 +262,9 @@ export class HlsPlaylistMutator {
           return segment;
         }),
       )
+      .with({ type: 'through_date' }, ({ through }) =>
+        reject(eligible, (segment) => segment.startTime.isAfter(through)),
+      )
       .exhaustive();
 
     // Always the NEWEST segments, never the oldest.
@@ -269,9 +279,15 @@ export class HlsPlaylistMutator {
     // invisible. Taking the last N puts the window where the content actually is.
     //
     // The no-match fallback uses the newest of the ELIGIBLE set rather than of
-    // everything, so a window can never end up empty just because nothing met the soft
-    // anchor - while still never reaching below the physical floor.
-    const source = preferred.length > 0 ? preferred : eligible;
+    // everything, while still never reaching below the physical floor. The scheduled
+    // wall-time cutoff is stricter: an empty match stays empty rather than exposing
+    // future content to an unanchored client.
+    const source =
+      preferred.length > 0
+        ? preferred
+        : filterOptions.type === 'through_date'
+          ? []
+          : eligible;
     allSegments =
       source.length > maxSegmentsToKeep
         ? takeRight(source, maxSegmentsToKeep)
