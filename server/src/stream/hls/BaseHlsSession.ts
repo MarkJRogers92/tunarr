@@ -47,6 +47,10 @@ export abstract class BaseHlsSession<
     return this._minByIp.has(clientIp);
   }
 
+  public resetSegmentPosition(clientIp: string): void {
+    this._minByIp.delete(clientIp);
+  }
+
   constructor(
     channel: ChannelOrmWithTranscodeConfig,
     options: HlsSessionOptsT,

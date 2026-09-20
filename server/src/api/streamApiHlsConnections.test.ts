@@ -257,4 +257,57 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
       { clientIp: '203.0.113.20', hasSegmentAnchor: true },
     ]);
   });
+
+  it('resets a same-IP standard-HLS reconnect to scheduled time until it requests another segment', async () => {
+    await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/data000100.ts`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(session.hasSegmentPosition('203.0.113.10')).toBe(true);
+
+    const master = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}.m3u8`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(master.statusCode).toBe(200);
+    expect(session.hasSegmentPosition('203.0.113.10')).toBe(false);
+
+    const variant = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(variant.body).toContain('#SCHEDULED');
+
+    await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/data000010.ts`,
+      remoteAddress: '203.0.113.10',
+    });
+    const reanchoredVariant = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(reanchoredVariant.body).toContain('#NORMAL-HEAD');
+  });
+
+  it('does not reset a same-IP hls_direct_v2 reconnect', async () => {
+    await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}/hls_direct_v2/data000100.ts`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(session.hasSegmentPosition('203.0.113.10')).toBe(true);
+
+    const master = await app.inject({
+      method: 'GET',
+      url: `/stream/channels/${makeChannel().uuid}.m3u8?mode=hls_direct_v2`,
+      remoteAddress: '203.0.113.10',
+    });
+    expect(master.statusCode).toBe(200);
+    expect(session.hasSegmentPosition('203.0.113.10')).toBe(true);
+  });
 });

@@ -420,6 +420,16 @@ export const streamApi: RouterPluginAsyncCallback = async (fastify) => {
             })
             .then((result) =>
               result.mapAsync(async (session) => {
+                if (mode === 'hls') {
+                  // A master-playlist request starts a new standard-HLS playback
+                  // handshake. Clear an earlier position for this IP so its first
+                  // variant playlist is anchored to scheduled wall time again.
+                  //
+                  // Client IP is the current connection identity. Multiple players
+                  // behind one shared IP therefore still share this reset and position;
+                  // separating them requires a future token/cookie or URL redesign.
+                  session.resetSegmentPosition(req.ip);
+                }
                 session.recordHeartbeat(req.ip);
                 const masterResult = await session.getMasterPlaylist();
 
