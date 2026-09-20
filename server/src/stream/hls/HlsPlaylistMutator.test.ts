@@ -302,6 +302,42 @@ describe('HlsPlaylistMutator', () => {
       expect(result.playlist).toContain('#EXT-X-DISCONTINUITY');
     });
 
+    it('reconstructs monotonic time when a new ffmpeg process resets raw time', () => {
+      const start = dayjs('2026-09-19T20:00:00.000-0500');
+      const lines = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:6',
+        '#EXT-X-TARGETDURATION:4',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+        '#EXTINF:4.000000,',
+        '#EXT-X-PROGRAM-DATE-TIME:2026-09-19T20:00:00.000-0500',
+        '/stream/channels/test/hls/data000000.ts',
+        '#EXT-X-DISCONTINUITY',
+        '#EXTINF:4.000000,',
+        '#EXT-X-PROGRAM-DATE-TIME:2026-09-19T19:59:30.000-0500',
+        '/stream/channels/test/hls/data000001.ts',
+        '#EXTINF:4.000000,',
+        '#EXT-X-PROGRAM-DATE-TIME:2026-09-19T19:59:34.000-0500',
+        '/stream/channels/test/hls/data000002.ts',
+      ];
+      const result = mutator.trimPlaylist(
+        start,
+        { type: 'before_date', before: start },
+        lines,
+        defaultOpts,
+      );
+      const times = result.playlist
+        .split('\n')
+        .filter((line) => line.startsWith('#EXT-X-PROGRAM-DATE-TIME:'))
+        .map((line) => dayjs(line.slice(line.indexOf(':') + 1)).valueOf());
+
+      expect(times).toEqual([
+        start.valueOf(),
+        start.add(4, 'seconds').valueOf(),
+        start.add(8, 'seconds').valueOf(),
+      ]);
+    });
+
     it('should return correct playlistStart time', () => {
       const lines = createPlaylist(10);
       const start = dayjs('2024-10-18T14:00:00.000-0400');
