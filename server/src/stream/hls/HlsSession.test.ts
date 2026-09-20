@@ -3,12 +3,17 @@ import type { ChannelOrmWithTranscodeConfig } from '@/db/schema/derivedTypes.js'
 import type { OutputFormat } from '@/ffmpeg/builder/constants.js';
 import type { OnDemandChannelService } from '@/services/OnDemandChannelService.js';
 import type { PlayerContext } from '@/stream/PlayerStreamContext.js';
-import type { StreamProgramCalculator } from '@/stream/StreamProgramCalculator.js';
+import type {
+  CurrentLineupItemResult,
+  StreamProgramCalculator,
+} from '@/stream/StreamProgramCalculator.js';
 import type { StreamLineupItem } from '@/db/derived_types/StreamLineup.js';
 import tmp from 'tmp';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { ProgramStream } from '../ProgramStream.ts';
 import {
+  applyHlsProducerDecision,
+  createHlsProducerPlayerContext,
   decideHlsProducerWork,
   HlsSession,
   prepareHlsProducerItem,
@@ -81,6 +86,19 @@ function makeSession(transcodeDirectory: string): HlsSession {
 }
 describe('HlsSession', () => {
   describe('bounded producer policy', () => {
+    test('reports only catch-up state transitions', () => {
+      expect(applyHlsProducerDecision(false, 40, 'hls').transition).toBe(
+        'entered',
+      );
+      expect(applyHlsProducerDecision(true, 70, 'hls').transition).toBeUndefined();
+      expect(applyHlsProducerDecision(true, 90, 'hls').transition).toBe(
+        'exited',
+      );
+      expect(
+        applyHlsProducerDecision(false, Number.NaN, 'hls').transition,
+      ).toBeUndefined();
+    });
+
     test.each([
       { reserve: 0, wasCatchingUp: false, expected: true },
       { reserve: 59.999, wasCatchingUp: false, expected: true },
@@ -128,6 +146,40 @@ describe('HlsSession', () => {
   });
 
   describe('bounded producer work units', () => {
+    test('builds bounded unpaced and full-duration paced player contexts', () => {
+      const channel = {
+        uuid: channelUuid,
+      } as unknown as CurrentLineupItemResult['channelContext'];
+      const result: CurrentLineupItemResult = {
+        lineupItem: contentItem('program', 120_000),
+        channelContext: channel,
+        sourceChannel: channel,
+      };
+      const transcodeConfig =
+        {} as unknown as ChannelOrmWithTranscodeConfig['transcodeConfig'];
+
+      const catchUp = createHlsProducerPlayerContext(
+        result,
+        transcodeConfig,
+        'hls',
+        { catchingUp: true, maxWorkDurationMs: 30_000 },
+      );
+      expect(catchUp.lineupItem.streamDuration).toBe(30_000);
+      expect(catchUp.lineupItem.startOffset).toBe(480_000);
+      expect(catchUp.realtime).toBe(true);
+      expect(catchUp.suppressInputThrottle).toBe(true);
+
+      const paced = createHlsProducerPlayerContext(
+        result,
+        transcodeConfig,
+        'hls',
+        { catchingUp: false, maxWorkDurationMs: undefined },
+      );
+      expect(paced.lineupItem.streamDuration).toBe(120_000);
+      expect(paced.realtime).toBe(true);
+      expect(paced.suppressInputThrottle).toBe(false);
+    });
+
     test.each(['program', 'commercial', 'fallback'] as const)(
       'caps %s without changing its source offset',
       (type) => {

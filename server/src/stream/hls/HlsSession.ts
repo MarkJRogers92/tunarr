@@ -13,7 +13,10 @@ import {
 } from '@/ffmpeg/builder/constants.js';
 import type { OnDemandChannelService } from '@/services/OnDemandChannelService.js';
 import { PlayerContext } from '@/stream/PlayerStreamContext.js';
-import type { StreamProgramCalculator } from '@/stream/StreamProgramCalculator.js';
+import type {
+  CurrentLineupItemResult,
+  StreamProgramCalculator,
+} from '@/stream/StreamProgramCalculator.js';
 import type { HlsSlowerSession } from '@/stream/hls/HlsSlowerSession.js';
 import type {
   AudioRenditionInfo,
@@ -60,6 +63,8 @@ export type HlsProducerWorkDecision = {
   maxWorkDurationMs: number | undefined;
 };
 
+export type HlsProducerTransition = 'entered' | 'exited';
+
 export function decideHlsProducerWork(
   reserveSeconds: number,
   wasCatchingUp: boolean,
@@ -97,10 +102,44 @@ export function prepareHlsProducerItem(
   };
 }
 
-export function shouldPaceHlsTranscode(
-  _transcodeBufferSeconds: number,
-): boolean {
-  return true;
+export function applyHlsProducerDecision(
+  wasCatchingUp: boolean,
+  reserveSeconds: number,
+  streamMode: HlsSessionOptions['streamMode'],
+): HlsProducerWorkDecision & { transition?: HlsProducerTransition } {
+  const decision = decideHlsProducerWork(
+    reserveSeconds,
+    wasCatchingUp,
+    streamMode,
+  );
+  const transition =
+    decision.catchingUp === wasCatchingUp
+      ? undefined
+      : decision.catchingUp
+        ? 'entered'
+        : 'exited';
+  return transition === undefined ? decision : { ...decision, transition };
+}
+
+export function createHlsProducerPlayerContext(
+  result: CurrentLineupItemResult,
+  transcodeConfig: ChannelOrmWithTranscodeConfig['transcodeConfig'],
+  streamMode: HlsSessionOptions['streamMode'],
+  decision: HlsProducerWorkDecision,
+): PlayerContext {
+  const prepared = prepareHlsProducerItem(result.lineupItem, decision);
+  return new PlayerContext(
+    prepared.lineupItem,
+    result.channelContext,
+    result.sourceChannel,
+    transcodeConfig,
+    {
+      audioOnly: false,
+      realtime: true,
+      suppressInputThrottle: prepared.suppressInputThrottle,
+      streamMode,
+    },
+  );
 }
 
 /**
@@ -123,6 +162,8 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
   #highestDeletedBelow = 0;
   #currentSubtitleRendition: SubtitleRenditionInfo | undefined;
   #currentAudioRenditions: AudioRenditionInfo[] = [];
+  #catchingUp = false;
+  #invalidReserveWarningActive = false;
 
   constructor(
     channel: ChannelOrmWithTranscodeConfig,
@@ -285,6 +326,8 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
 
     this.state = 'started';
     this.#playlistStart = this.transcodedUntil = dayjs();
+    this.#catchingUp = false;
+    this.#invalidReserveWarningActive = false;
     // Fire-and-forget
     this.run().catch((e) => this.logger.error(e));
   }
@@ -295,17 +338,38 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         .duration(dayjs(this.transcodedUntil).diff())
         .asSeconds();
 
-      // Keep a bounded cushion, but never build it by running an individual
-      // process faster than realtime. Doing so puts PROGRAM-DATE-TIME ahead of
-      // the wall clock and makes the following process jump backwards.
-      if (transcodeBuffer <= 300) {
-        const realtime = shouldPaceHlsTranscode(transcodeBuffer);
-        this.logger.trace(
-          'Transcode buffer is %d. Starting next transcode (realtime = %s)',
+      if (!Number.isFinite(transcodeBuffer) || transcodeBuffer <= 300) {
+        const invalidReserve = !Number.isFinite(transcodeBuffer);
+        if (invalidReserve && !this.#invalidReserveWarningActive) {
+          this.logger.warn(
+            'HLS producer reserve is invalid; falling back to paced work (channel=%s, reserve=%s)',
+            this.channel.uuid,
+            transcodeBuffer,
+          );
+        }
+        this.#invalidReserveWarningActive = invalidReserve;
+
+        const decision = applyHlsProducerDecision(
+          this.#catchingUp,
           transcodeBuffer,
-          realtime,
+          this.sessionType,
         );
-        await this.transcode(realtime);
+        this.#catchingUp = decision.catchingUp;
+        if (decision.transition !== undefined) {
+          this.logger.info(
+            'HLS producer catch-up %s (channel=%s, reserve=%d seconds, target=%d seconds)',
+            decision.transition,
+            this.channel.uuid,
+            transcodeBuffer,
+            HLS_CATCH_UP_EXIT_SECONDS,
+          );
+        }
+        this.logger.trace(
+          'Transcode buffer is %d. Starting next transcode (catching up = %s)',
+          transcodeBuffer,
+          decision.catchingUp,
+        );
+        await this.transcode(decision);
         this.#isFirstTranscode = false;
       } else {
         // trim and delete
@@ -335,7 +399,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     }
   }
 
-  private async transcode(realtime: boolean) {
+  private async transcode(decision: HlsProducerWorkDecision) {
     const ptsOffset =
       this.#isFirstTranscode ||
       this.sessionOptions.streamMode === 'hls_direct_v2'
@@ -356,32 +420,11 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         'About to play lineup item: %s',
         JSON.stringify(result.lineupItem, undefined, 4),
       );
-      const context = new PlayerContext(
-        result.lineupItem,
-        result.channelContext,
-        result.sourceChannel,
+      const context = createHlsProducerPlayerContext(
+        result,
         this.channel.transcodeConfig,
-        {
-          audioOnly: false,
-          realtime,
-          // CONTAINMENT - the throttle override is deliberately NOT set here.
-          //
-          // It was enabled on 2026-09-18 and made playback worse, not better. The reason
-          // is that removing the input throttle lets the producer race far ahead: the
-          // measured lead reached +448s, while the served window is `takeRight` and a
-          // client plays at AIR time, `lead` seconds behind the head. At a 7.5-minute lead
-          // inside an 8-minute window the client sat on the edge and was pushed outside it
-          // as soon as production ran further ahead, at which point its own segments
-          // stopped being advertised and playback errored.
-          //
-          // The missing piece is a production BOUND, not a removed throttle: the job that
-          // overshot was 537 seconds long, because the 300-second between-item gate is not
-          // a within-item limit. Until that bound exists (capped work units with
-          // source-preserving continuation), the producer stays paced. The
-          // `suppressInputThrottle` policy itself is retained, tested and default-off, so
-          // re-enabling it is one line once the bound is in place.
-          streamMode: this.sessionType,
-        },
+        this.sessionType,
+        decision,
       );
 
       let programStream = this.getProgramStream(context, ptsOffset);
@@ -404,11 +447,11 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
 
         programStream = this.getProgramStream(
           PlayerContext.error(
-            result.lineupItem.streamDuration ?? result.lineupItem.duration,
+            context.lineupItem.streamDuration ?? context.lineupItem.duration,
             transcodeSessionResult.error,
             result.channelContext,
             this.channel,
-            realtime,
+            true,
             this.channel.transcodeConfig,
             this.sessionType,
           ),

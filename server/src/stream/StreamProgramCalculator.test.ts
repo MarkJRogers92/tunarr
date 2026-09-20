@@ -698,6 +698,21 @@ describe('StreamProgramCalculator', () => {
         startOffset: expectedStartOffset,
         streamDuration: seg2Duration - twoMinutes,
       });
+
+      const thirtySeconds = +dayjs.duration({ seconds: 30 });
+      const next = (
+        await calc.getCurrentLineupItem({
+          allowSkip: false,
+          channelId: 1,
+          startTime: currentTime + thirtySeconds,
+        })
+      ).get();
+      expect(next.lineupItem).toMatchObject<DeepPartial<StreamLineupItem>>({
+        type: 'program',
+        program: { uuid: programId },
+        startOffset: expectedStartOffset + thirtySeconds,
+        streamDuration: seg2Duration - twoMinutes - thirtySeconds,
+      });
     },
   );
 
