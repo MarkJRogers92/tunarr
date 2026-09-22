@@ -156,6 +156,26 @@ describe('SessionManager', () => {
     vi.useRealTimers();
   });
 
+  describe('HLS startup buffering', () => {
+    it('uses one completed segment for normal HLS startup readiness', async () => {
+      let capturedOptions: HlsSessionOptions | undefined;
+      const manager = makeSessionManager((channel, options) => {
+        capturedOptions = options;
+        return new StubHlsSession(channel, options);
+      });
+
+      const result = await manager.getOrCreateHlsSession(
+        channelUuid,
+        'startup-token',
+        connection,
+        { streamMode: 'hls' },
+      );
+
+      expect(result.isSuccess()).toBe(true);
+      expect(capturedOptions?.initialSegmentCount).toBe(1);
+    });
+  });
+
   describe('session replacement race condition', () => {
     it('stop event from Session A does not delete Session B at the same key', async () => {
       // Track which sessions the factory creates so we can reference them

@@ -24,6 +24,50 @@ import {
 } from './StreamProgramCalculator.ts';
 
 describe('StreamProgramCalculator', () => {
+  baseTest('exact playback preserves short cards and resumes chunks without replay', async () => {
+    const channelDB = mock<IChannelDB>();
+    const programDB = mock<IProgramDB>();
+    const historyDB = mock<ProgramPlayHistoryDB>();
+    const channelId = faker.string.uuid();
+    const ids = [faker.string.uuid(), faker.string.uuid(), faker.string.uuid()];
+    const items: LineupItem[] = ids.map((id, index) => ({
+      type: 'content', id, durationMs: [30_000, 5_000, 600_000][index]!,
+    }));
+    const startTime = +dayjs('2026-09-22T06:00:00.000Z');
+    when(channelDB.getChannelOrm(1)).thenResolve(createChannelOrm({
+      uuid: channelId, number: 1, startTime, duration: 635_000,
+    }));
+    when(channelDB.loadLineup(channelId)).thenResolve({
+      version: 1, items, startTimeOffsets: [0, 30_000, 35_000, 635_000], lastUpdated: now(),
+    });
+    ids.forEach((id, index) => when(programDB.getProgramById(id)).thenResolve(
+      createFakeProgram({
+        uuid: id, duration: items[index]!.durationMs,
+        mediaSourceId: tag<MediaSourceId>('local-test'),
+      }),
+    ));
+    when(historyDB.isProgramCurrentlyPlaying(anything(), anything(), anything())).thenResolve(true);
+    const calc = new StreamProgramCalculator(
+      instance(mock<IFillerListDB>()), instance(channelDB), instance(programDB),
+      instance(mock<IFillerPicker>()), instance(historyDB),
+    );
+    for (const [at, index, offset, remaining] of [
+      [20_057, 0, 20_057, 9_943],
+      [30_000, 1, 0, 5_000],
+      [34_999, 1, 4_999, 1],
+      [35_000, 2, 0, 600_000],
+      [155_000, 2, 120_000, 480_000],
+    ]) {
+      const result = (await calc.getCurrentLineupItem({
+        channelId: 1, startTime: startTime + at!, allowSkip: false,
+      })).get();
+      expect(result.lineupItem).toMatchObject({
+        type: 'program', program: { uuid: ids[index!] },
+        startOffset: offset, streamDuration: remaining,
+      });
+    }
+  });
+
   baseTest('getCurrentLineupItem simple', async () => {
     const fillerDB = mock<IFillerListDB>();
     const channelDB = mock<IChannelDB>();

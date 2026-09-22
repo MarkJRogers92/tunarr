@@ -115,12 +115,12 @@ describe('HlsSession', () => {
         type: 'produce',
         decision: {
           catchingUp: false,
-          maxWorkDurationMs: undefined,
+          maxWorkDurationMs: 120_000,
         },
       });
     });
 
-    test('paces one bounded startup window, then waits for a real segment anchor', () => {
+    test('paces the bounded startup window before normal production', () => {
       const initial = decideHlsProducerCycle({
         reserveSeconds: 0,
         recoveredInvalidClock: false,
@@ -136,7 +136,7 @@ describe('HlsSession', () => {
         decision: { catchingUp: false, maxWorkDurationMs: 8_000 },
       });
 
-      const waiting = decideHlsProducerCycle({
+      const afterStartup = decideHlsProducerCycle({
         reserveSeconds: 0,
         recoveredInvalidClock: false,
         wasCatchingUp: false,
@@ -146,7 +146,10 @@ describe('HlsSession', () => {
         initialSegmentCount: 2,
         segmentDurationSeconds: 4,
       });
-      expect(waiting).toEqual({ type: 'wait_for_segment_anchor' });
+      expect(afterStartup).toEqual({
+        type: 'produce',
+        decision: { catchingUp: false, maxWorkDurationMs: 120_000 },
+      });
       expect(
         decideHlsProducerCycle({
           reserveSeconds: 0,
@@ -158,7 +161,28 @@ describe('HlsSession', () => {
           initialSegmentCount: 2,
           segmentDurationSeconds: 4,
         }),
-      ).toEqual({ type: 'wait_for_segment_anchor' });
+      ).toEqual({
+        type: 'produce',
+        decision: { catchingUp: false, maxWorkDurationMs: 120_000 },
+      });
+    });
+
+    test('continues paced production when Safari never requests a startup segment', () => {
+      expect(
+        decideHlsProducerCycle({
+          reserveSeconds: 0,
+          recoveredInvalidClock: false,
+          wasCatchingUp: false,
+          streamMode: 'hls',
+          hasSegmentAnchor: false,
+          startupProducedMs: 12_000,
+          initialSegmentCount: 3,
+          segmentDurationSeconds: 4,
+        }),
+      ).toEqual({
+        type: 'produce',
+        decision: { catchingUp: false, maxWorkDurationMs: 120_000 },
+      });
     });
 
     test('uses normal catch-up policy after the first segment anchor exists', () => {
@@ -176,6 +200,13 @@ describe('HlsSession', () => {
       ).toMatchObject({
         type: 'produce',
         decision: { catchingUp: true, maxWorkDurationMs: 30_000 },
+      });
+    });
+
+    test('bounds paced HLS work so a slow encoder cannot drain the reserve for an entire program', () => {
+      expect(decideHlsProducerWork(90, false, 'hls')).toEqual({
+        catchingUp: false,
+        maxWorkDurationMs: 120_000,
       });
     });
 
@@ -248,11 +279,11 @@ describe('HlsSession', () => {
     );
 
     test.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
-      'fails closed for invalid reserve %s',
+      'keeps paced HLS bounded for invalid reserve %s',
       (reserve) => {
         expect(decideHlsProducerWork(reserve, true, 'hls')).toEqual({
           catchingUp: false,
-          maxWorkDurationMs: undefined,
+          maxWorkDurationMs: 120_000,
         });
       },
     );
@@ -277,7 +308,7 @@ describe('HlsSession', () => {
   });
 
   describe('bounded producer work units', () => {
-    test('builds bounded unpaced and full-duration paced player contexts', () => {
+    test('builds bounded unpaced and paced player contexts', () => {
       const channel = {
         uuid: channelUuid,
       } as unknown as CurrentLineupItemResult['channelContext'];
@@ -304,7 +335,7 @@ describe('HlsSession', () => {
         result,
         transcodeConfig,
         'hls',
-        { catchingUp: false, maxWorkDurationMs: undefined },
+        { catchingUp: false, maxWorkDurationMs: 120_000 },
       );
       expect(paced.lineupItem.streamDuration).toBe(120_000);
       expect(paced.realtime).toBe(true);
@@ -343,14 +374,14 @@ describe('HlsSession', () => {
       expect(prepared.lineupItem.streamDuration).toBe(12_000);
     });
 
-    test('leaves paced content unbounded', () => {
-      const original = contentItem('program', 120_000);
-      expect(
-        prepareHlsProducerItem(original, {
-          catchingUp: false,
-          maxWorkDurationMs: undefined,
-        }),
-      ).toEqual({ lineupItem: original, suppressInputThrottle: false });
+    test('bounds long paced content without suppressing input throttling', () => {
+      const original = contentItem('program', 450_000);
+      const prepared = prepareHlsProducerItem(original, {
+        catchingUp: false,
+        maxWorkDurationMs: 120_000,
+      });
+      expect(prepared.lineupItem.streamDuration).toBe(120_000);
+      expect(prepared.suppressInputThrottle).toBe(false);
     });
 
     test('bounds a paced startup item without suppressing input throttling', () => {

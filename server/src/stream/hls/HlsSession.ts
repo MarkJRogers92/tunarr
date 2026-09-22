@@ -57,6 +57,7 @@ export interface HlsSessionOptions extends BaseHlsSessionOptions {
 export const HLS_CATCH_UP_ENTER_SECONDS = 60;
 export const HLS_CATCH_UP_EXIT_SECONDS = 90;
 export const HLS_CATCH_UP_WORK_UNIT_MS = 30_000;
+export const HLS_PACED_WORK_UNIT_MS = 120_000;
 
 export type HlsProducerWorkDecision = {
   catchingUp: boolean;
@@ -115,15 +116,20 @@ export function decideHlsProducerWork(
   wasCatchingUp: boolean,
   streamMode: HlsSessionOptions['streamMode'],
 ): HlsProducerWorkDecision {
-  if (!Number.isFinite(reserveSeconds) || streamMode !== 'hls') {
+  if (streamMode !== 'hls') {
     return { catchingUp: false, maxWorkDurationMs: undefined };
+  }
+  if (!Number.isFinite(reserveSeconds)) {
+    return { catchingUp: false, maxWorkDurationMs: HLS_PACED_WORK_UNIT_MS };
   }
   const catchingUp = wasCatchingUp
     ? reserveSeconds < HLS_CATCH_UP_EXIT_SECONDS
     : reserveSeconds < HLS_CATCH_UP_ENTER_SECONDS;
   return {
     catchingUp,
-    maxWorkDurationMs: catchingUp ? HLS_CATCH_UP_WORK_UNIT_MS : undefined,
+    maxWorkDurationMs: catchingUp
+      ? HLS_CATCH_UP_WORK_UNIT_MS
+      : HLS_PACED_WORK_UNIT_MS,
   };
 }
 
@@ -186,7 +192,17 @@ export function decideHlsProducerCycle(
     const remainingStartupMs =
       startupWindowSeconds * 1_000 - input.startupProducedMs;
     if (remainingStartupMs <= 0) {
-      return { type: 'wait_for_segment_anchor' };
+      // Some native HLS clients (notably Safari) can begin playback without
+      // requesting a media segment before the startup window is consumed.
+      // Keep producing at realtime in that case; waiting here leaves the
+      // client parked exactly at the end of its initial buffer.
+      return {
+        type: 'produce',
+        decision: {
+          catchingUp: false,
+          maxWorkDurationMs: HLS_PACED_WORK_UNIT_MS,
+        },
+      };
     }
     return {
       type: 'produce',
@@ -203,10 +219,13 @@ export function decideHlsProducerCycle(
       decision: input.wasCatchingUp
         ? {
             catchingUp: false,
-            maxWorkDurationMs: undefined,
+            maxWorkDurationMs: HLS_PACED_WORK_UNIT_MS,
             transition: 'exited',
           }
-        : { catchingUp: false, maxWorkDurationMs: undefined },
+        : {
+            catchingUp: false,
+            maxWorkDurationMs: HLS_PACED_WORK_UNIT_MS,
+          },
     };
   }
 
@@ -554,7 +573,10 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
         : await this.getPtsOffset();
 
     const lineupItemResult = await this.programCalculator.getCurrentLineupItem({
-      allowSkip: true,
+      // A continuous producer must consume the entire slot. Starting the next
+      // programme early leaves transcodedUntil behind its source position and
+      // replays that difference on the following chunk; short cards can vanish.
+      allowSkip: false,
       channelId: this.channel.uuid,
       startTime: await this.onDemandService.getLiveTimestamp(
         this.channel.uuid,

@@ -249,7 +249,7 @@ export class SessionManager {
       options?.streamMode ?? 'hls',
       (channel) =>
         this.hlsSessionFactory(channel, {
-          initialSegmentCount: 2, // 8 seconds of content
+          initialSegmentCount: 1, // one completed segment is enough to start
           transcodeDirectory:
             this.settingsDB.ffmpegSettings().transcodeDirectory,
           streamMode: options?.streamMode ?? 'hls',

@@ -118,6 +118,7 @@ export class StreamProgramCalculator {
       startTime,
       channel,
       lineup,
+      req.allowSkip,
     );
     // We cannot exceed this amount of time, since that is what was scheduled
     // on the channel.
@@ -163,6 +164,7 @@ export class StreamProgramCalculator {
         req.startTime,
         channelContext,
         newChannelAndLineup.lineup,
+        req.allowSkip,
       );
 
       const timeLeft =
@@ -298,6 +300,7 @@ export class StreamProgramCalculator {
     timestamp: number,
     channel: MinimalChannelDetails,
     channelLineup: Lineup,
+    allowSkip: boolean,
   ): Promise<ProgramAndTimeElapsed> {
     if (channel.startTime > timestamp) {
       this.logger.debug(
@@ -319,6 +322,7 @@ export class StreamProgramCalculator {
         channel.startTime,
         channel.duration,
         channelLineup,
+        allowSkip ? SLACK : 0,
       );
 
     let lineupItem: LineupItem;

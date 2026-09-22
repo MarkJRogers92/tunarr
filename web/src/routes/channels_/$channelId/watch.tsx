@@ -3,11 +3,10 @@ import ChannelWatchPage from '@/pages/watch/ChannelWatchPage';
 import { createFileRoute } from '@tanstack/react-router';
 import { z } from 'zod/v4';
 
-const watchPageSearchSchema = z.object({
-  noAutoPlay: z.coerce
-    .boolean()
-    .or(z.string().transform((s) => s === 'true'))
-    .catch(true),
+export const watchPageSearchSchema = z.object({
+  noAutoPlay: z
+    .union([z.boolean(), z.string().transform((s) => s === 'true')])
+    .catch(false),
 });
 
 export const Route = createFileRoute('/channels_/$channelId/watch')({

@@ -30,6 +30,14 @@ fs.cpSync('src/resources/images', `${DIST_DIR}/resources/images`, {
   recursive: true,
 });
 
+// The server serves the dashboard and database migrations from paths beside
+// bundle.cjs at runtime. `make-bin` copies these assets for release archives,
+// but the local patched service runs the bundle output directly, so its bundle
+// must be complete on its own as well.
+console.log('Copying web app and migrations...');
+fs.cpSync('../web/dist', `${DIST_DIR}/web`, { recursive: true });
+fs.cpSync('src/migration/db/sql', `${DIST_DIR}/sql`, { recursive: true });
+
 const isEdgeBuild = process.env.TUNARR_EDGE_BUILD === 'true';
 
 // TODO: Do we want to hard-code any TUNARR_ prefixed environment variables at build time?
