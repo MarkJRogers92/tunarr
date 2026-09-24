@@ -12,6 +12,19 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type stream from 'node:stream';
 import { LastNBytesStream } from '../util/LastNBytesStream.ts';
+import {
+  allocateInvocation,
+  appendReceipt,
+  countStatsRows,
+  insertStatsArgs,
+  parseInvocationArgs,
+  receiptDirectory,
+} from '@/stream/hls/autopilotReceipt.js';
+
+const redactReceipt = (value: string): string =>
+  value
+    .replaceAll(/(X-Plex-Token=)([A-z0-9_\\-]+)/g, '$1REDACTED')
+    .replaceAll(/(X-Emby-Token:\s)([A-z0-9_\\-]+)/g, '$1REDACTED');
 
 export type FfmpegEvents = {
   // Emitted when the process ended with a code === 0, i.e. it exited
@@ -96,12 +109,38 @@ export class FfmpegProcess extends events.EventEmitter<FfmpegEvents> {
       }`;
     }
 
-    this.#processHandle = spawn(this.ffmpegPath, this.ffmpegArgs, {
+    // Shadow receipt (default off): when TUNARR_AUTOPILOT_RECEIPT names a
+    // directory, add mux-pre stats options and record what this invocation was
+    // asked to do. With the variable unset the command is byte-identical.
+    const receiptDir = receiptDirectory();
+    const receipt =
+      receiptDir !== null ? allocateInvocation(receiptDir) : null;
+    const spawnArgs =
+      receipt !== null
+        ? insertStatsArgs(this.ffmpegArgs, receipt.statsFile)
+        : this.ffmpegArgs;
+
+    this.#processHandle = spawn(this.ffmpegPath, spawnArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
     });
 
     this.#running = true;
+
+    if (receipt !== null && receiptDir !== null) {
+      const parsed = parseInvocationArgs(spawnArgs);
+      appendReceipt(receiptDir, {
+        kind: 'invocation',
+        invocationId: receipt.invocationId,
+        pid: this.#processHandle.pid ?? null,
+        sourceId: parsed.sourceId !== null ? redactReceipt(parsed.sourceId) : null,
+        requestedOffsetMs: parsed.requestedOffsetMs,
+        mode: parsed.mode,
+        statsFile: receipt.statsFile,
+        args: spawnArgs.map(redactReceipt),
+        startedAt: new Date().toISOString(),
+      });
+    }
 
     // Pipe to our own stderr if enabled
     if (this.ffmpegSettings.enableLogging) {
@@ -146,6 +185,24 @@ export class FfmpegProcess extends events.EventEmitter<FfmpegEvents> {
       );
 
       this.emit('exit', code, signal, expected);
+
+      if (receipt !== null && receiptDir !== null) {
+        const { invocationId, statsFile } = receipt;
+        void fs
+          .readFile(statsFile, 'utf-8')
+          .then((text) => countStatsRows(text))
+          .catch(() => 0)
+          .then((statsRows) =>
+            appendReceipt(receiptDir, {
+              kind: 'completion',
+              invocationId,
+              exitCode: code,
+              signal,
+              statsRows,
+              finishedAt: new Date().toISOString(),
+            }),
+          );
+      }
 
       if (expected) {
         this.emit('end');
