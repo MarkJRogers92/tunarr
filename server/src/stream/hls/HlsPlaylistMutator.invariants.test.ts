@@ -130,7 +130,7 @@ describe('HLS playlist identity and physical-floor invariants', () => {
     );
   });
 
-  it('never pads a short filtered result with files below the physical floor', () => {
+  it('[PL09] never pads a short filtered result with files below the physical floor', () => {
     const result = new HlsPlaylistMutator().trimPlaylist(
       origin,
       selector(12, 12),

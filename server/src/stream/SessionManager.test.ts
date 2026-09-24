@@ -468,7 +468,7 @@ describe('SessionManager', () => {
       return { manager, session: sessions[0]! };
     }
 
-    it('keeps producing when the channel is not on-demand', async () => {
+    it('[PL10] keeps producing when the channel is not on-demand', async () => {
       const { manager, session } = await idleSession({ onDemand: false });
 
       await manager.cleanupStaleSessions();

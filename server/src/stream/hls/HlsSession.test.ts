@@ -459,7 +459,7 @@ describe('HlsSession', () => {
       expect(resolvePtsOffset({ kind: 'no-segment' }, 900)).toBe(0);
     });
 
-    test('an unreadable segment continues the timeline instead of restarting it', () => {
+    test('[PL08] an unreadable segment continues the timeline instead of restarting it', () => {
       // The regression: a probe failure used to return 0, collapsing the
       // timeline to its start. The directory is not empty in this case, so zero
       // is never the right answer.
@@ -520,7 +520,7 @@ describe('HlsSession', () => {
       );
     }
 
-    test('offers an unanchored client the same live edge as an anchored one', async () => {
+    test('[PL13] offers an unanchored client the same live edge as an anchored one', async () => {
       // Fake timers keep `dayjs()` (the scheduled-time cutoff) stable.
       vi.useFakeTimers({ toFake: ['Date'] });
       try {

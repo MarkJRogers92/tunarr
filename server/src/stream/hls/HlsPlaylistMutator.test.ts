@@ -315,7 +315,7 @@ describe('HlsPlaylistMutator', () => {
       expect(result.playlist).toContain('#EXT-X-DISCONTINUITY');
     });
 
-    it('reconstructs monotonic time when a new ffmpeg process resets raw time', () => {
+    it('[PL16] reconstructs monotonic time when a new ffmpeg process resets raw time', () => {
       const start = dayjs('2026-09-19T20:00:00.000-0500');
       const lines = [
         '#EXTM3U',
@@ -656,7 +656,7 @@ describe('HlsPlaylistMutator', () => {
       expect(discTagCount(result.playlist)).toBe(0);
     });
 
-    it('disc-seq is monotonically non-decreasing as the DISC rolls off the window', () => {
+    it('[PL11] disc-seq is monotonically non-decreasing as the DISC rolls off the window', () => {
       // Simulates three consecutive playlist polls as the client advances
       const poll1 = trimWithSegmentFilter(25); // DISC in middle of window
       const poll2 = trimWithSegmentFilter(41); // DISC before first selected (no segs before it)
