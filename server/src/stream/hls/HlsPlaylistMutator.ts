@@ -184,30 +184,29 @@ export class HlsPlaylistMutator {
       //
       // USE THE TAG. This used to seed everything from the `start` argument and
       // add EXTINF durations forward, ignoring the tag on the very line it steps
-      // over. Those two timelines are not equal: EXTINF is a segment's nominal
-      // length, and its sum does not match the real presentation timestamps at
-      // item boundaries (keyframe alignment, -output_ts_offset, dropped frames).
-      // Measured on a live channel, the re-derived timeline ran 113.98s AHEAD of
-      // the tags over 1404 segments - 0.0812s per segment - so the served
-      // playlist advertised a live edge 109s in the future while the audio and
-      // video in those segments were 5s behind wall clock. That drift is not
-      // cosmetic: `trimPlaylistForClient` serves a client with no recorded
-      // segment position through the `through_date` rule, which drops every
-      // segment after `now`, so a head 109s in the future got clipped ~28
-      // segments below the producer's head while the same client one request
-      // later (position now recorded) got a window ending AT the head. The
-      // published live edge jumped ~104s backwards and the player resynced or
-      // died - reported live as a channel that "rewound on its own".
+      // over. The tags are the truth about when each segment airs, and they agree
+      // with wall clock; a re-derived timeline has no reason to.
       //
-      // ONLY WHEN IT ADVANCES. The working directory is written by a succession
-      // of FFmpeg processes, one per lineup item, each starting its own raw
-      // timeline with its own -output_ts_offset. A raw tag can therefore jump
-      // BACKWARDS, and publishing that is the same rewind from the client's
-      // side (see 'reconstructs monotonic time when a new ffmpeg process resets
-      // raw time'). So the tag is honoured only when it moves past the segment
-      // already published before it; otherwise `currentTime` carries the
-      // timeline forward by EXTINF exactly as it always did. The invariant is
-      // that a published segment's time never precedes its predecessor's.
+      // ONLY WHEN IT ADVANCES. The tags of a live install are NOT monotonic. The
+      // working directory is written by a succession of FFmpeg processes, one per
+      // lineup item, each starting its own raw timeline with its own
+      // schedule-derived -output_ts_offset, and while the producer is running
+      // ahead the next item's offset lands BEHIND where the previous process
+      // finished. Measured on a live channel: 165 segments contained FIVE backward
+      // steps - 26.0s, 3.2s, 22.8s, 21.1s, 21.6s, 94.7s in total. Publishing a
+      // backwards jump is itself a rewind for the player (see 'reconstructs
+      // monotonic time when a new ffmpeg process resets raw time'), so those are
+      // repaired: the tag is honoured only when it moves past the segment already
+      // published before it, and otherwise `currentTime` carries the timeline
+      // forward by EXTINF exactly as it always did. The invariant is that a
+      // published segment's time never precedes its predecessor's.
+      //
+      // The price of that repair is that the served timeline ends up ~95s AHEAD of
+      // the tags once a jump has happened. That is why the served window's END
+      // must not depend on the caller: see `trimPlaylistForClient`, whose
+      // wall-clock-bounded branch used to clip the tail below the producer's head
+      // and made the advertised live edge jump backwards ~96s for any client that
+      // lost its recorded segment position.
       const taggedTime = parseProgramDateTime(playlistLines[i + 1]);
       const startTime =
         taggedTime !== undefined &&

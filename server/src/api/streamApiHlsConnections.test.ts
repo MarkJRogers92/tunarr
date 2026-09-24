@@ -51,12 +51,16 @@ class TestHlsSession extends BaseHlsSession {
   async trimPlaylistForClient(clientIp: string) {
     const hasSegmentAnchor = this.hasSegmentPosition(clientIp);
     this.playlistRequests.push({ clientIp, hasSegmentAnchor });
+    // ONE body for both states on purpose. A client's recorded segment position
+    // used to change the window's END, and because the served timeline runs a
+    // cushion ahead of wall clock those two ends were ~96s apart: every client
+    // that lost its position record saw the live edge jump backwards. See
+    // HlsSession.trimPlaylistForClient. `hasSegmentAnchor` is still recorded
+    // because the position bookkeeping itself is real and must keep working.
     return Result.success({
       playlistStart: new Date(),
-      sequence: hasSegmentAnchor ? 100 : 10,
-      playlist: hasSegmentAnchor
-        ? '#EXTM3U\n#NORMAL-HEAD'
-        : '#EXTM3U\n#SCHEDULED',
+      sequence: 100,
+      playlist: '#EXTM3U\n#LIVE-HEAD',
       segmentCount: 1,
       discontinuitySequence: 0,
     });
@@ -204,53 +208,44 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
     expect(session.minSegment).toBe(100);
   });
 
-  it('keeps initial and late-joining clients at scheduled time until their first existing segment request', async () => {
-    const initialPoll = await app.inject({
-      method: 'GET',
-      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
-      remoteAddress: '203.0.113.10',
-    });
-    const repeatedPoll = await app.inject({
-      method: 'GET',
-      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
-      remoteAddress: '203.0.113.10',
-    });
-    expect(initialPoll.body).toContain('#SCHEDULED');
-    expect(repeatedPoll.body).toContain('#SCHEDULED');
+  it('serves the same variant playlist whether or not the client has a recorded segment position', async () => {
+    const poll = (ip: string) =>
+      app.inject({
+        method: 'GET',
+        url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
+        remoteAddress: ip,
+      });
 
+    // No position yet for either client.
+    const firstPoll = await poll('203.0.113.10');
+    expect(firstPoll.body).toContain('#LIVE-HEAD');
+
+    // A requests an existing segment, so it now has a position.
     await app.inject({
       method: 'GET',
       url: `/stream/channels/${makeChannel().uuid}/hls/data000100.ts`,
       remoteAddress: '203.0.113.10',
     });
-    const anchoredPoll = await app.inject({
-      method: 'GET',
-      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
-      remoteAddress: '203.0.113.10',
-    });
-    expect(anchoredPoll.body).toContain('#NORMAL-HEAD');
+    const anchoredPoll = await poll('203.0.113.10');
+    expect(anchoredPoll.body).toContain('#LIVE-HEAD');
 
-    const lateJoinerPoll = await app.inject({
-      method: 'GET',
-      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
-      remoteAddress: '203.0.113.20',
-    });
-    expect(lateJoinerPoll.body).toContain('#SCHEDULED');
+    // A late joiner with no position must be offered the SAME live edge, not one
+    // clipped back to wall clock: the two used to differ by the producer's
+    // cushion (~96s measured), so a client that lost its position saw a rewind.
+    const lateJoinerPoll = await poll('203.0.113.20');
+    expect(lateJoinerPoll.body).toContain('#LIVE-HEAD');
+    expect(lateJoinerPoll.body).toBe(anchoredPoll.body);
 
     await app.inject({
       method: 'GET',
       url: `/stream/channels/${makeChannel().uuid}/hls/data000010.ts`,
       remoteAddress: '203.0.113.20',
     });
-    const lateJoinerAnchoredPoll = await app.inject({
-      method: 'GET',
-      url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
-      remoteAddress: '203.0.113.20',
-    });
-    expect(lateJoinerAnchoredPoll.body).toContain('#NORMAL-HEAD');
+    const lateJoinerAnchoredPoll = await poll('203.0.113.20');
+    expect(lateJoinerAnchoredPoll.body).toBe(firstPoll.body);
 
+    // The position bookkeeping itself is still per-client and still real.
     expect(session.playlistRequests).toEqual([
-      { clientIp: '203.0.113.10', hasSegmentAnchor: false },
       { clientIp: '203.0.113.10', hasSegmentAnchor: false },
       { clientIp: '203.0.113.10', hasSegmentAnchor: true },
       { clientIp: '203.0.113.20', hasSegmentAnchor: false },
@@ -258,7 +253,7 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
     ]);
   });
 
-  it('resets a same-IP standard-HLS reconnect to scheduled time until it requests another segment', async () => {
+  it('a same-IP standard-HLS reconnect still releases the position without changing the window', async () => {
     await app.inject({
       method: 'GET',
       url: `/stream/channels/${makeChannel().uuid}/hls/data000100.ts`,
@@ -272,14 +267,18 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
       remoteAddress: '203.0.113.10',
     });
     expect(master.statusCode).toBe(200);
+    // The master handshake still clears the position (that is what the
+    // stale-cleanup release in the test above depends on)...
     expect(session.hasSegmentPosition('203.0.113.10')).toBe(false);
 
+    // ...but it must NOT change what the client is offered. This is the exact
+    // point where a reconnecting player used to be pushed backwards.
     const variant = await app.inject({
       method: 'GET',
       url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
       remoteAddress: '203.0.113.10',
     });
-    expect(variant.body).toContain('#SCHEDULED');
+    expect(variant.body).toContain('#LIVE-HEAD');
 
     await app.inject({
       method: 'GET',
@@ -291,7 +290,7 @@ describe('streamApi HLS connection registration (issue #2045 invariant)', () => 
       url: `/stream/channels/${makeChannel().uuid}/hls/stream.m3u8`,
       remoteAddress: '203.0.113.10',
     });
-    expect(reanchoredVariant.body).toContain('#NORMAL-HEAD');
+    expect(reanchoredVariant.body).toBe(variant.body);
   });
 
   it('does not reset a same-IP hls_direct_v2 reconnect', async () => {

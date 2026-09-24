@@ -8,6 +8,9 @@ import type {
   StreamProgramCalculator,
 } from '@/stream/StreamProgramCalculator.js';
 import type { StreamLineupItem } from '@/db/derived_types/StreamLineup.js';
+import dayjs from 'dayjs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import tmp from 'tmp';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { ProgramStream } from '../ProgramStream.ts';
@@ -435,6 +438,77 @@ describe('HlsSession', () => {
       const result = await session.getMasterPlaylist();
       expect(result.isSuccess()).toBe(true);
       expect(result.get()).toBeUndefined();
+    });
+  });
+
+  // The served window's END must not depend on whether the client has a recorded
+  // segment position. It used to: an unanchored client got a `through_date`
+  // window bounded by wall-clock `now`, and because a live channel's served
+  // timeline runs a cushion ahead of `now` (the producer produces ahead, and
+  // FFmpeg's tags that step backwards at item boundaries are repaired into a
+  // monotonic timeline), that clipped the tail below the producer's head. A
+  // player starts at the END of the window, so every client that lost its
+  // position record - which happens on each master-playlist fetch, on a
+  // reconnect, or after 120s of quiet - saw the live edge jump backwards.
+  describe('the served window does not depend on the client position record', () => {
+    let dir: tmp.DirResult;
+
+    beforeEach(() => {
+      dir = tmp.dirSync({ unsafeCleanup: true });
+    });
+
+    afterEach(() => {
+      dir.removeCallback();
+    });
+
+    const HEAD_SEGMENT = 'data000014.ts';
+
+    /** A 15 segment playlist whose tags run from +60s to +116s from now. */
+    async function writeCushionedPlaylist(session: HlsSession) {
+      await mkdir(session.workingDirectory, { recursive: true });
+      const first = dayjs().add(60, 'second').startOf('second');
+      const lines = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:6',
+        '#EXT-X-TARGETDURATION:4',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+      ];
+      for (let n = 0; n < 15; n++) {
+        lines.push(
+          '#EXTINF:4.004000,',
+          `#EXT-X-PROGRAM-DATE-TIME:${first
+            .add(n * 4, 'second')
+            .format('YYYY-MM-DDTHH:mm:ss.SSSZZ')}`,
+          `/stream/channels/${channelUuid}/hls/data${String(n).padStart(6, '0')}.ts`,
+        );
+      }
+      await writeFile(
+        join(session.workingDirectory, 'stream.m3u8'),
+        lines.join('\n'),
+      );
+    }
+
+    test('offers an unanchored client the same live edge as an anchored one', async () => {
+      // Fake timers keep `dayjs()` (the scheduled-time cutoff) stable.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        const session = makeSession(dir.name);
+        await writeCushionedPlaylist(session);
+
+        const unanchored = await session.trimPlaylistForClient('203.0.113.9');
+        expect(unanchored.isSuccess()).toBe(true);
+        const unanchoredPlaylist = unanchored.get()?.playlist;
+        expect(unanchoredPlaylist).toContain(HEAD_SEGMENT);
+
+        // The same client, now with a position recorded, must be offered the
+        // identical window rather than one ending further forward.
+        session.onSegmentRequested('203.0.113.9', 'data000010.ts');
+        const anchored = await session.trimPlaylistForClient('203.0.113.9');
+        expect(anchored.isSuccess()).toBe(true);
+        expect(anchored.get()?.playlist).toBe(unanchoredPlaylist);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

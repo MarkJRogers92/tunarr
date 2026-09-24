@@ -447,15 +447,38 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     });
   }
 
-  async trimPlaylistForClient(clientIp: string, scheduledTime = dayjs()) {
-    if (this.hasSegmentPosition(clientIp)) {
-      return this.trimPlaylist();
+  /**
+   * The variant playlist for a client.
+   *
+   * ONE window rule, whatever the client's state. This used to branch: a client
+   * with a recorded segment position got the window ending at the producer's
+   * head, and one without got a `through_date` window bounded by wall-clock
+   * `now`. Those are not the same end. The producer deliberately runs a cushion
+   * ahead of `now`, and FFmpeg's program-date-time tags step backwards at item
+   * boundaries, so the served timeline is repaired into a monotonic one that
+   * runs a further ~95s ahead of the tags. MEASURED, same instant, same channel:
+   * a client with a position was offered segment 135 while a client without one
+   * was offered segment 111 - 24 segments, ~96 seconds, apart.
+   *
+   * Every client that lost its position record therefore saw the advertised live
+   * edge jump BACKWARDS by the cushion, and a player starts at the END of the
+   * window, so the two rules also disagreed about what "live" meant. Position
+   * records are dropped on every master-playlist fetch, on a reconnect, on a NAT
+   * rebind or a dual-stack flip (the connection key is `req.ip`), and after 120s
+   * of quiet - that is the rewind viewers reported.
+   *
+   * Ending at the producer's head is what every anchored client already got, so
+   * this makes the special case match the common one. `clientIp` is kept for the
+   * diagnostic below, which is how the divergence was found.
+   */
+  async trimPlaylistForClient(clientIp: string) {
+    if (!this.hasSegmentPosition(clientIp)) {
+      this.logger.debug(
+        'Serving the live window to client %s, which has no recorded segment position',
+        clientIp,
+      );
     }
-    return this.trimPlaylist({
-      type: 'through_date',
-      through: scheduledTime,
-      segmentFloor: this.#highestDeletedBelow,
-    });
+    return this.trimPlaylist();
   }
 
   protected async startInternal() {
