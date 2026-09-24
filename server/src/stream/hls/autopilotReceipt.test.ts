@@ -5,6 +5,7 @@ import {
   insertStatsArgs,
   parseInvocationArgs,
   receiptDirectory,
+  receiptStatsEnabled,
 } from './autopilotReceipt.ts';
 
 describe('autopilot receipt capture', () => {
@@ -14,6 +15,12 @@ describe('autopilot receipt capture', () => {
     expect(receiptDirectory({ TUNARR_AUTOPILOT_RECEIPT: '/tmp/x' })).toBe(
       '/tmp/x',
     );
+  });
+
+  test('stats injection is a separate, opt-in switch', () => {
+    expect(receiptStatsEnabled({})).toBe(false);
+    expect(receiptStatsEnabled({ TUNARR_AUTOPILOT_RECEIPT_STATS: '' })).toBe(false);
+    expect(receiptStatsEnabled({ TUNARR_AUTOPILOT_RECEIPT_STATS: '1' })).toBe(true);
   });
 
   test('reads the invocation off its own arguments', () => {

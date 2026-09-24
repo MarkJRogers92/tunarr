@@ -27,7 +27,8 @@ export type AutopilotInvocationRecord = {
   /** The `-ss` seek the invocation was given, in milliseconds. */
   requestedOffsetMs: number;
   mode: "transcode" | "copy";
-  statsFile: string;
+  /** The stats output path, or null when only the invocation was recorded. */
+  statsFile: string | null;
   args: string[];
   startedAt: string;
 };
@@ -48,6 +49,17 @@ export type AutopilotReceiptRecord = AutopilotInvocationRecord | AutopilotComple
 export function receiptDirectory(env: NodeJS.ProcessEnv = process.env): string | null {
   const value = env.TUNARR_AUTOPILOT_RECEIPT;
   return value !== undefined && value.trim() !== "" ? value : null;
+}
+
+/**
+ * Whether to also inject the mux-pre stats options. Separate from the receipt
+ * directory on purpose: recording the invocation alone does NOT touch the FFmpeg
+ * command, so it can be deployed and observed with zero risk to playback, and the
+ * real output-argument position can be confirmed before any command change.
+ */
+export function receiptStatsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.TUNARR_AUTOPILOT_RECEIPT_STATS;
+  return value !== undefined && value !== "";
 }
 
 function parseSeek(value: string): number {

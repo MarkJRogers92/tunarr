@@ -19,6 +19,7 @@ import {
   insertStatsArgs,
   parseInvocationArgs,
   receiptDirectory,
+  receiptStatsEnabled,
 } from '@/stream/hls/autopilotReceipt.js';
 
 const redactReceipt = (value: string): string =>
@@ -112,11 +113,17 @@ export class FfmpegProcess extends events.EventEmitter<FfmpegEvents> {
     // Shadow receipt (default off): when TUNARR_AUTOPILOT_RECEIPT names a
     // directory, add mux-pre stats options and record what this invocation was
     // asked to do. With the variable unset the command is byte-identical.
+    // Shadow receipt (default off): when TUNARR_AUTOPILOT_RECEIPT names a
+    // directory, record what this invocation was asked to do. The FFmpeg command
+    // is only modified (mux-pre stats options added) when
+    // TUNARR_AUTOPILOT_RECEIPT_STATS is also set, so the record-only mode is a
+    // zero-risk observation of the real arguments.
     const receiptDir = receiptDirectory();
     const receipt =
       receiptDir !== null ? allocateInvocation(receiptDir) : null;
+    const withStats = receipt !== null && receiptStatsEnabled();
     const spawnArgs =
-      receipt !== null
+      receipt !== null && withStats
         ? insertStatsArgs(this.ffmpegArgs, receipt.statsFile)
         : this.ffmpegArgs;
 
@@ -136,7 +143,7 @@ export class FfmpegProcess extends events.EventEmitter<FfmpegEvents> {
         sourceId: parsed.sourceId !== null ? redactReceipt(parsed.sourceId) : null,
         requestedOffsetMs: parsed.requestedOffsetMs,
         mode: parsed.mode,
-        statsFile: receipt.statsFile,
+        statsFile: withStats ? receipt.statsFile : null,
         args: spawnArgs.map(redactReceipt),
         startedAt: new Date().toISOString(),
       });
@@ -188,20 +195,20 @@ export class FfmpegProcess extends events.EventEmitter<FfmpegEvents> {
 
       if (receipt !== null && receiptDir !== null) {
         const { invocationId, statsFile } = receipt;
-        void fs
-          .readFile(statsFile, 'utf-8')
-          .then((text) => countStatsRows(text))
-          .catch(() => 0)
-          .then((statsRows) =>
-            appendReceipt(receiptDir, {
-              kind: 'completion',
-              invocationId,
-              exitCode: code,
-              signal,
-              statsRows,
-              finishedAt: new Date().toISOString(),
-            }),
-          );
+        const readStats =
+          withStats
+            ? fs.readFile(statsFile, 'utf-8').then(countStatsRows).catch(() => 0)
+            : Promise.resolve(0);
+        void readStats.then((statsRows) =>
+          appendReceipt(receiptDir, {
+            kind: 'completion',
+            invocationId,
+            exitCode: code,
+            signal,
+            statsRows,
+            finishedAt: new Date().toISOString(),
+          }),
+        );
       }
 
       if (expected) {
