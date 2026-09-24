@@ -84,6 +84,24 @@ export const HOLD_BACK_SECONDS = 180;
  */
 const MIN_SEGMENTS_TO_SERVE = 10;
 
+const ProgramDateTimePrefix = '#EXT-X-PROGRAM-DATE-TIME:';
+
+/**
+ * The segment's own program date time, when the tag is present and parses.
+ *
+ * Returns undefined for an absent, empty, or unparsable tag so the caller can
+ * fall back to accumulating EXTINF durations, which is the only option for a
+ * playlist FFmpeg produced without program date times.
+ */
+function parseProgramDateTime(tagLine: string | undefined): Dayjs | undefined {
+  if (tagLine === undefined || !tagLine.startsWith(ProgramDateTimePrefix)) {
+    return undefined;
+  }
+
+  const parsed = dayjs(tagLine.slice(ProgramDateTimePrefix.length).trim());
+  return parsed.isValid() ? parsed : undefined;
+}
+
 export class HlsPlaylistMutator {
   trimPlaylist(
     start: Dayjs,
@@ -123,6 +141,10 @@ export class HlsPlaylistMutator {
     const items: PlaylistLine[] = [];
 
     let i = 0;
+    // The monotonic fallback, and the time of the segment published before the
+    // current one. A tagged time is only adopted when it advances past
+    // `previousStart`; otherwise the tag is a raw-timeline reset, not a move.
+    let previousStart: Dayjs | undefined;
     let currentTime = start;
 
     while (
@@ -155,9 +177,47 @@ export class HlsPlaylistMutator {
 
       // EXTINF
       const duration = parseFloat(trimEnd(line.trim(), ',').split(':')[1]!);
-      items.push(new PlaylistSegment(currentTime, line, playlistLines[i + 2]!));
+      // A segment's time is the one FFmpeg WROTE for it - unless that would move
+      // the timeline backwards, in which case continue monotonically instead.
+      //
+      // Both halves are load-bearing and each was measured.
+      //
+      // USE THE TAG. This used to seed everything from the `start` argument and
+      // add EXTINF durations forward, ignoring the tag on the very line it steps
+      // over. Those two timelines are not equal: EXTINF is a segment's nominal
+      // length, and its sum does not match the real presentation timestamps at
+      // item boundaries (keyframe alignment, -output_ts_offset, dropped frames).
+      // Measured on a live channel, the re-derived timeline ran 113.98s AHEAD of
+      // the tags over 1404 segments - 0.0812s per segment - so the served
+      // playlist advertised a live edge 109s in the future while the audio and
+      // video in those segments were 5s behind wall clock. That drift is not
+      // cosmetic: `trimPlaylistForClient` serves a client with no recorded
+      // segment position through the `through_date` rule, which drops every
+      // segment after `now`, so a head 109s in the future got clipped ~28
+      // segments below the producer's head while the same client one request
+      // later (position now recorded) got a window ending AT the head. The
+      // published live edge jumped ~104s backwards and the player resynced or
+      // died - reported live as a channel that "rewound on its own".
+      //
+      // ONLY WHEN IT ADVANCES. The working directory is written by a succession
+      // of FFmpeg processes, one per lineup item, each starting its own raw
+      // timeline with its own -output_ts_offset. A raw tag can therefore jump
+      // BACKWARDS, and publishing that is the same rewind from the client's
+      // side (see 'reconstructs monotonic time when a new ffmpeg process resets
+      // raw time'). So the tag is honoured only when it moves past the segment
+      // already published before it; otherwise `currentTime` carries the
+      // timeline forward by EXTINF exactly as it always did. The invariant is
+      // that a published segment's time never precedes its predecessor's.
+      const taggedTime = parseProgramDateTime(playlistLines[i + 1]);
+      const startTime =
+        taggedTime !== undefined &&
+        (previousStart === undefined || taggedTime.isAfter(previousStart))
+          ? taggedTime
+          : currentTime;
+      items.push(new PlaylistSegment(startTime, line, playlistLines[i + 2]!));
 
-      currentTime = currentTime.add(duration, 'seconds');
+      previousStart = startTime;
+      currentTime = startTime.add(duration, 'seconds');
       i += 3;
     }
 

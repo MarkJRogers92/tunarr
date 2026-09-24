@@ -1,4 +1,5 @@
 import dayjs from 'dayjs';
+import type { Dayjs } from 'dayjs';
 import { describe, expect, it } from 'vitest';
 import { readTestFile } from '../../testing/util.ts';
 import { HlsPlaylistMutator } from './HlsPlaylistMutator.ts';
@@ -14,7 +15,17 @@ describe('HlsPlaylistMutator', () => {
 
   // Helper to create a minimal playlist
   // Note: SegmentNameRegex expects 6-digit segment numbers (data000000.ts)
-  function createPlaylist(segments: number, startNum = 0): string[] {
+  //
+  // `base` is the time of the first segment: the tags advance 4s per segment
+  // from there. Tests that filter by time (`through_date`, `before_date`) must
+  // pass the same instant they pass as `start`, because the mutator reads these
+  // tags as authoritative when they advance the timeline. The default is only
+  // for tests that do not look at times at all.
+  function createPlaylist(
+    segments: number,
+    startNum = 0,
+    base = dayjs('2024-10-18T14:00:00.000-0400'),
+  ): string[] {
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
@@ -24,7 +35,9 @@ describe('HlsPlaylistMutator', () => {
     for (let i = startNum; i < startNum + segments; i++) {
       lines.push(
         `#EXTINF:4.004000,`,
-        `#EXT-X-PROGRAM-DATE-TIME:2024-10-18T14:00:${String(i * 4).padStart(2, '0')}.000-0400`,
+        `#EXT-X-PROGRAM-DATE-TIME:${base
+          .add((i - startNum) * 4, 'seconds')
+          .format('YYYY-MM-DDTHH:mm:ss.SSSZZ')}`,
         `/stream/channels/test-channel/hls/data${String(i).padStart(6, '0')}.ts`,
       );
     }
@@ -356,7 +369,7 @@ describe('HlsPlaylistMutator', () => {
           through: start.add(9, 'seconds'),
           segmentFloor: 1,
         },
-        createPlaylist(6),
+        createPlaylist(6, 0, start),
         defaultOpts,
       );
 
@@ -373,7 +386,7 @@ describe('HlsPlaylistMutator', () => {
       const result = mutator.trimPlaylist(
         start,
         { type: 'through_date', through: start.subtract(1, 'second') },
-        createPlaylist(3),
+        createPlaylist(3, 0, start),
         defaultOpts,
       );
 
@@ -1189,6 +1202,113 @@ describe('HlsPlaylistMutator', () => {
       // Asking for more hold-back than the session contains must not produce an
       // unplayable playlist - a young session has to keep playing.
       expect(served(trim(3600).playlist).length).toBeGreaterThan(0);
+    });
+  });
+
+  // The served program date times must be the ones FFmpeg WROTE. Re-deriving
+  // them from EXTINF durations drifts ahead of the real presentation timeline,
+  // and the drift moves the published live edge when the trim rule switches.
+  // Reproduced on a live channel: the served head claimed a time 109s in the
+  // FUTURE of wall clock while the file's own tag for that same segment was 5s
+  // behind, and the advertised live edge jumped ~104s backwards between two
+  // consecutive polls. See the measurement in parsePlaylist.
+  describe('program date times come from the file, not from EXTINF arithmetic', () => {
+    const uri = (n: number) =>
+      `/stream/channels/test-channel/hls/data${String(n).padStart(6, '0')}.ts`;
+
+    const servedSegments = (playlist: string) =>
+      playlist
+        .split('\n')
+        .filter((line) => line.includes('/hls/data'))
+        .map((line) => line.split('/').pop());
+
+    // EXTINF deliberately disagrees with the tag step: 5s nominal against a 4s
+    // real step, which is the shape of the drift seen live (0.0812s per segment
+    // over 1404 segments).
+    function driftedPlaylist(count: number, firstTag: Dayjs): string[] {
+      const lines = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:6',
+        '#EXT-X-TARGETDURATION:4',
+        '#EXT-X-MEDIA-SEQUENCE:1290',
+      ];
+      for (let n = 0; n < count; n++) {
+        lines.push(
+          '#EXTINF:5.000000,',
+          `#EXT-X-PROGRAM-DATE-TIME:${firstTag
+            .add(n * 4, 'seconds')
+            .format('YYYY-MM-DDTHH:mm:ss.SSSZZ')}`,
+          uri(1290 + n),
+        );
+      }
+      return lines;
+    }
+
+    it('parses each segment time from its own tag, not from the running total', () => {
+      const firstTag = dayjs('2024-10-18T14:00:00.000-0600');
+      const items = mutator.parsePlaylist(
+        // A seed far from the tags: if this were used, every time below is wrong.
+        dayjs('2024-10-18T13:00:00.000-0600'),
+        driftedPlaylist(20, firstTag),
+        false,
+      );
+      const times = items.flatMap((item) =>
+        item.type === 'segment' ? [item.startTime.toISOString()] : [],
+      );
+
+      expect(times[0]).toBe(firstTag.toISOString());
+      // Segment 19's tag is 76s after the first; a re-derived timeline would put
+      // it 95s after (19 x 5s) instead.
+      expect(times[19]).toBe(firstTag.add(76, 'seconds').toISOString());
+    });
+
+    it('falls back to accumulating EXTINF when a playlist carries no tags', () => {
+      const start = dayjs('2024-10-18T14:00:00.000-0600');
+      const lines = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:6',
+        '#EXT-X-TARGETDURATION:4',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+        '#EXTINF:5.000000,',
+        uri(0),
+        '#EXTINF:5.000000,',
+        uri(1),
+      ];
+      const times = mutator
+        .parsePlaylist(start, lines, false)
+        .flatMap((item) =>
+          item.type === 'segment' ? [item.startTime.toISOString()] : [],
+        );
+
+      expect(times).toEqual([
+        start.toISOString(),
+        start.add(5, 'seconds').toISOString(),
+      ]);
+    });
+
+    it('an unanchored client is still served through to the producer head', () => {
+      // `through_date` drops segments after `through`. When the served times were
+      // re-derived and ran ahead of wall clock, `through = now` cut the newest
+      // segments off the tail, so the live edge the player was following moved
+      // backwards. With the tags read, the head is behind `now` and survives.
+      const now = dayjs('2024-10-18T14:00:00.000-0600');
+      const lines = driftedPlaylist(40, now.subtract(160, 'seconds'));
+
+      const result = mutator.trimPlaylist(
+        now,
+        { type: 'through_date', through: now },
+        lines,
+        { ...defaultOpts, maxSegmentsToKeep: 300 },
+      );
+
+      const served = servedSegments(result.playlist);
+      expect(served.at(-1)).toBe('data001329.ts');
+      // And the advertised time of that head is its real one, in the past.
+      expect(result.playlist).toContain(
+        `#EXT-X-PROGRAM-DATE-TIME:${now
+          .subtract(4, 'seconds')
+          .format('YYYY-MM-DDTHH:mm:ss.SSSZZ')}`,
+      );
     });
   });
 });
