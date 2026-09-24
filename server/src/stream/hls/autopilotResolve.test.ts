@@ -11,6 +11,7 @@ import {
   probeHlsSegments,
   resolveInvocation,
   segmentNameRegex,
+  verifySeekBasis,
 } from './autopilotResolve.ts';
 
 const ARGS = [
@@ -58,6 +59,21 @@ describe('autopilot resolve', () => {
         deps,
       ),
     ).toEqual({ ok: false, reason: 'no-segment-pattern' });
+  });
+
+  test('verifySeekBasis accepts a frame-aligned seek and rejects a keyframe pre-roll', () => {
+    // Offline probe: -ss 2 at 30fps; ni is the ABSOLUTE input frame (60 = 2s x
+    // 30fps) while ptsi is relative to the landing point.
+    const aligned =
+      '0,0,1/90000,0,1/15360,60,0\n1,12000,1/90000,2048,1/15360,64,0.133333\n';
+    expect(verifySeekBasis(aligned, 2)).toBe(true);
+
+    // Same relative times but ni says the frames are really 1.5s into the
+    // source, not 2s: the seek landed on an earlier keyframe, so the relative
+    // basis would be wrong and must be refused.
+    const preroll =
+      '0,0,1/90000,0,1/15360,45,0\n1,12000,1/90000,2048,1/15360,49,0.133333\n';
+    expect(verifySeekBasis(preroll, 2)).toBe(false);
   });
 
   test('a non-zero input seek fails closed - no verified seek basis', async () => {

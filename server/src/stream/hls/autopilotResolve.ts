@@ -73,6 +73,69 @@ export function firstStatsRow(text: string): { pts: number; tb: string } | null 
   return Number.isSafeInteger(value) ? { pts: value, tb } : null;
 }
 
+type InputRow = { ptsi: number; tiSeconds: number; ni: number };
+
+function parseTimeBase(value: string): number | undefined {
+  const match = /^(\d+)\/(\d+)$/.exec(value);
+  if (!match || Number(match[2]) === 0) return undefined;
+  const tick = Number(match[1]) / Number(match[2]);
+  return Number.isFinite(tick) && tick > 0 ? tick : undefined;
+}
+
+function parseInputRows(text: string): InputRow[] {
+  const rows: InputRow[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const fields = line.trim().split(',');
+    if (fields.length !== 7) continue;
+    const tick = parseTimeBase(fields[4]!);
+    const ptsi = Number(fields[3]);
+    const ni = Number(fields[5]);
+    if (tick === undefined || !Number.isSafeInteger(ptsi) || !Number.isSafeInteger(ni))
+      continue;
+    rows.push({ ptsi, tiSeconds: ptsi * tick, ni });
+  }
+  return rows;
+}
+
+/** Per-frame input duration derived from the rows' own input PTS and frame index. */
+export function deriveInputFrameSeconds(text: string): number | null {
+  const rows = parseInputRows(text).sort((a, b) => a.ni - b.ni);
+  if (rows.length < 2) return null;
+  const first = rows[0]!;
+  const last = rows[rows.length - 1]!;
+  const frames = last.ni - first.ni;
+  const seconds = last.tiSeconds - first.tiSeconds;
+  if (frames <= 0 || seconds <= 0) return null;
+  const frameSeconds = seconds / frames;
+  return Number.isFinite(frameSeconds) && frameSeconds > 0 ? frameSeconds : null;
+}
+
+/**
+ * Verifies the input-seek basis from the invocation's own stats.
+ *
+ * A non-zero `-ss` is an INPUT seek, so `ti`/`ptsi` are RELATIVE to the landing
+ * point and alone cannot say where in the source a frame really is. But `ni` is
+ * the ABSOLUTE input frame index, so `ni / fps` is an independent source time.
+ * When it agrees with the mapper's `requestedOffset + ptsi` within a frame, the
+ * seek landed where it was asked to and a relative basis is safe; when it does
+ * not (a keyframe pre-roll), the basis is genuinely unknown and the caller must
+ * fail closed.
+ */
+export function verifySeekBasis(
+  text: string,
+  requestedOffsetSeconds: number,
+): boolean {
+  const rows = parseInputRows(text);
+  if (rows.length === 0) return false;
+  const frameSeconds = deriveInputFrameSeconds(text);
+  if (frameSeconds === null) return false;
+  return rows.every(
+    (row) =>
+      Math.abs(row.ni * frameSeconds - (requestedOffsetSeconds + row.tiSeconds)) <=
+      frameSeconds,
+  );
+}
+
 /** Regex matching the files an HLS `-hls_segment_filename` printf pattern names. */
 export function segmentNameRegex(pattern: string): RegExp {
   const base = basename(pattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -203,10 +266,15 @@ export async function resolveInvocation(
       mode: record.mode ?? 'transcode',
       authenticated: true,
       discontinuities: 'none',
-      // A non-zero INPUT seek lands on the preceding keyframe, so the first
-      // packet's true source position is not known; fail closed rather than
-      // assert a relative basis that is not true.
-      seekBasis: requestedOffsetSeconds > 0 ? 'unknown' : 'not-applicable',
+      // A non-zero INPUT seek is relative to the landing point, so the basis is
+      // only trustworthy when the stats' own absolute frame index (ni/fps)
+      // agrees with the relative mapping. Otherwise fail closed.
+      seekBasis:
+        requestedOffsetSeconds > 0
+          ? verifySeekBasis(statsRows, requestedOffsetSeconds)
+            ? 'verified-relative'
+            : 'unknown'
+          : 'not-applicable',
     },
     statsRows,
     processOrigin: {
