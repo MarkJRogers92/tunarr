@@ -36,6 +36,8 @@ export type ResolveDependencies = {
   probeSegments: (input: {
     pattern: string;
     startedAt: string;
+    /** End of the invocation; segments outside [startedAt, finishedAt] are not its. */
+    finishedAt?: string | null;
   }) => Promise<ResolvedSegment[]>;
 };
 
@@ -182,17 +184,22 @@ const timeBaseArgs = (file: string) => [
  * resolver runs after the invocation exited and flushed.
  */
 export function probeHlsSegments(
-  input: { pattern: string; startedAt: string },
+  input: { pattern: string; startedAt: string; finishedAt?: string | null },
   run: SegmentProbeRunner,
 ): ResolvedSegment[] {
   const directory = dirname(input.pattern);
   const matcher = segmentNameRegex(input.pattern);
   const since = Date.parse(input.startedAt);
+  const until = input.finishedAt ? Date.parse(input.finishedAt) : Number.NaN;
   const segments: ResolvedSegment[] = [];
   for (const name of readdirSync(directory).sort()) {
     if (!matcher.test(name)) continue;
     const path = join(directory, name);
-    if (Number.isFinite(since) && statSync(path).mtimeMs < since - 1000) continue;
+    const mtimeMs = statSync(path).mtimeMs;
+    // Narrow to the invocation's own lifetime. Without an upper bound a short
+    // invocation claims every later segment too (172 for a 4-second one).
+    if (Number.isFinite(since) && mtimeMs < since - 1000) continue;
+    if (Number.isFinite(until) && mtimeMs > until + 1000) continue;
     const pts = parsePacketPts(run(path, packetArgs(path)));
     if (pts.length === 0) continue;
     segments.push({
@@ -230,6 +237,7 @@ export async function resolveInvocation(
     statsFile?: string | null;
     args?: string[];
     startedAt?: string;
+    finishedAt?: string | null;
   },
   deps: ResolveDependencies,
 ): Promise<ResolveResult> {
@@ -248,7 +256,11 @@ export async function resolveInvocation(
   if (!first) return { ok: false, reason: 'no-stats-rows' };
 
   const requestedOffsetSeconds = (record.requestedOffsetMs ?? 0) / 1000;
-  const segments = await deps.probeSegments({ pattern, startedAt: record.startedAt ?? '' });
+  const segments = await deps.probeSegments({
+    pattern,
+    startedAt: record.startedAt ?? '',
+    finishedAt: record.finishedAt ?? null,
+  });
   if (segments.length === 0) return { ok: false, reason: 'no-segments' };
 
   const processId = String(record.pid);

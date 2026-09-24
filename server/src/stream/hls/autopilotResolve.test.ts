@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -59,6 +59,25 @@ describe('autopilot resolve', () => {
         deps,
       ),
     ).toEqual({ ok: false, reason: 'no-segment-pattern' });
+  });
+
+  test('the segment window contains only the invocation that produced it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tunarr-win-'));
+    temporary.push(dir);
+    const at = (seconds: number) => new Date(seconds * 1000).toISOString();
+    const names = ['data000000.ts', 'data000001.ts', 'data000002.ts'];
+    for (const [index, name] of names.entries()) {
+      const p = join(dir, name);
+      await writeFile(p, 'x');
+      await utimes(p, 1_700_000_000 + index * 10, 1_700_000_000 + index * 10);
+    }
+    const run = (_f: string, args: string[]) => (args.includes('packet=pts') ? '1\n2\n' : '1/90000\n');
+    const segments = probeHlsSegments(
+      { pattern: join(dir, 'data%06d.ts'), startedAt: at(1_700_000_010), finishedAt: at(1_700_000_010) },
+      run,
+    );
+    // Only the segment written inside the invocation's own lifetime.
+    expect(segments.map((s) => s.path.split('/').pop())).toEqual(['data000001.ts']);
   });
 
   test('verifySeekBasis accepts a frame-aligned seek and rejects a keyframe pre-roll', () => {
