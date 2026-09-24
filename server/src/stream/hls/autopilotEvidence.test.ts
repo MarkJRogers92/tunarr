@@ -79,7 +79,7 @@ function makeInput(overrides: Partial<AutopilotEvidenceInput> = {}): AutopilotEv
 }
 
 describe('mapAuthenticatedStatsToClosedSegments', () => {
-  it('maps presentation-sorted B-frame stats to contiguous closed segment ranges', () => {
+  it('[PR06] maps presentation-sorted B-frame stats to contiguous closed segment ranges', () => {
     const result = mapAuthenticatedStatsToClosedSegments(makeInput());
 
     expect(result.ok).toBe(true);
