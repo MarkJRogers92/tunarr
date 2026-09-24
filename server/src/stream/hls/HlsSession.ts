@@ -172,6 +172,50 @@ export function applyHlsProducerDecision(
   return transition === undefined ? decision : { ...decision, transition };
 }
 
+/**
+ * What the next transcode's PTS offset is derived from.
+ *
+ * These are three genuinely different situations, not one with an error case:
+ * an empty directory, an unreadable segment, and a segment that read fine.
+ * Collapsing them all to "0" is what `resolvePtsOffset` exists to prevent.
+ */
+export type PtsOffsetSource =
+  | { kind: 'probed'; pts: number; duration: number }
+  | { kind: 'no-segment' }
+  | { kind: 'probe-failed' };
+
+/**
+ * The PTS offset to stamp the next item with, in seconds.
+ *
+ * `mediaClockSeconds` is the producer's own position in channel time, used only
+ * when the on-disk probe cannot answer.
+ */
+export function resolvePtsOffset(
+  source: PtsOffsetSource,
+  mediaClockSeconds: number,
+): number {
+  switch (source.kind) {
+    case 'probed':
+      // The probed segment's end is where the next item begins, plus a second of
+      // headroom so the two cannot overlap.
+      return source.pts + source.duration + 1;
+    case 'no-segment':
+      // Nothing on disk at all, so the timeline genuinely starts here.
+      return 0;
+    case 'probe-failed':
+      // The directory is NOT empty but the newest segment could not be read -
+      // usually because it is still being written. Returning 0 here (which this
+      // used to do) stamps the new item near the START of the timeline and
+      // collapses everything after it. The monotonic repair downstream means a
+      // viewer sees no rewind, but the served timeline then sits ahead of the
+      // guide, and it recovers only when a later probe succeeds. Continuing from
+      // the producer's own clock instead keeps the timeline where it actually is;
+      // that can be a second or so off, and it self-corrects on the next good
+      // probe, which is the right failure direction for a fallback.
+      return Math.max(0, mediaClockSeconds);
+  }
+}
+
 export function decideHlsProducerCycle(
   input: HlsProducerCycleInput,
 ): HlsProducerCycleDecision {
@@ -725,6 +769,21 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     });
   }
 
+  /**
+   * The producer's position in channel time, in seconds: how much media this
+   * session has emitted since it started. Only ever used as the fallback when the
+   * on-disk probe cannot answer, because it is derived from item durations rather
+   * than from the segments themselves.
+   */
+  private mediaClockSeconds() {
+    const start = this.#playlistStart;
+    const until = this.transcodedUntil;
+    if (!start || !until) {
+      return 0;
+    }
+    return Math.max(0, dayjs(until).diff(start, 'second', true));
+  }
+
   private async getPtsOffset() {
     const lastSegment = await this.getLastSegment();
 
@@ -732,7 +791,7 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
       if (!this.#isFirstTranscode) {
         this.logger.debug('No last segment found. Starting with PTS offset 0.');
       }
-      return 0;
+      return resolvePtsOffset({ kind: 'no-segment' }, this.mediaClockSeconds());
     }
 
     const result = await new GetLastPtsDurationTask(this.settingsDB).run(
@@ -740,13 +799,24 @@ export class HlsSession extends BaseHlsSession<HlsSessionOptions> {
     );
 
     if (result.isFailure()) {
-      this.logger.error(result.error);
-      return 0;
+      this.logger.error(
+        result.error,
+        'Could not read the last segment (%s). Continuing the timeline from the producer clock (%ds) instead of restarting it at 0.',
+        basename(lastSegment),
+        Math.floor(this.mediaClockSeconds()),
+      );
+      return resolvePtsOffset(
+        { kind: 'probe-failed' },
+        this.mediaClockSeconds(),
+      );
     }
 
     const { pts, duration } = result.get();
 
-    return pts + duration + 1;
+    return resolvePtsOffset(
+      { kind: 'probed', pts, duration },
+      this.mediaClockSeconds(),
+    );
   }
 
   private async getLastSegment() {

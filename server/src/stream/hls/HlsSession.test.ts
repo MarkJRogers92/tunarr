@@ -23,6 +23,7 @@ import {
   HlsSession,
   normalizeHlsProducerClock,
   prepareHlsProducerItem,
+  resolvePtsOffset,
 } from './HlsSession.js';
 
 vi.mock('@/util/logging/LoggerFactory.js', () => ({
@@ -441,15 +442,46 @@ describe('HlsSession', () => {
     });
   });
 
+  // The next item's PTS offset. Three inputs, three different answers: an empty
+  // directory, an unreadable segment, and a segment that read fine. Returning 0
+  // for the middle case - which is what this used to do - restarts the timeline
+  // mid-session instead of continuing it.
+  describe('PTS offset resolution', () => {
+    test('continues from the probed segment, with a second of headroom', () => {
+      expect(
+        resolvePtsOffset({ kind: 'probed', pts: 100.5, duration: 4 }, 104.4),
+      ).toBe(105.5);
+    });
+
+    test('starts at 0 when there is genuinely no segment on disk', () => {
+      // A fresh session: the timeline is supposed to start here, so the media
+      // clock must NOT be used as a "continuation".
+      expect(resolvePtsOffset({ kind: 'no-segment' }, 900)).toBe(0);
+    });
+
+    test('an unreadable segment continues the timeline instead of restarting it', () => {
+      // The regression: a probe failure used to return 0, collapsing the
+      // timeline to its start. The directory is not empty in this case, so zero
+      // is never the right answer.
+      const offset = resolvePtsOffset({ kind: 'probe-failed' }, 733.25);
+      expect(offset).toBe(733.25);
+      expect(offset).toBeGreaterThan(0);
+    });
+
+    test('a probe failure with no usable clock still cannot go negative', () => {
+      expect(resolvePtsOffset({ kind: 'probe-failed' }, -5)).toBe(0);
+      expect(resolvePtsOffset({ kind: 'probe-failed' }, 0)).toBe(0);
+    });
+  });
+
   // The served window's END must not depend on whether the client has a recorded
   // segment position. It used to: an unanchored client got a `through_date`
-  // window bounded by wall-clock `now`, and because a live channel's served
-  // timeline runs a cushion ahead of `now` (the producer produces ahead, and
-  // FFmpeg's tags that step backwards at item boundaries are repaired into a
-  // monotonic timeline), that clipped the tail below the producer's head. A
-  // player starts at the END of the window, so every client that lost its
-  // position record - which happens on each master-playlist fetch, on a
-  // reconnect, or after 120s of quiet - saw the live edge jump backwards.
+  // window bounded by wall-clock `now`, and a live channel's served timeline sits
+  // ahead of `now` (the producer produces ahead by design), which clipped the tail
+  // below the producer's head. A player starts at the END of the window, so every
+  // client that lost its position record - which happens on each master-playlist
+  // fetch, on a reconnect, or after 120s of quiet - saw the live edge jump
+  // backwards by the cushion.
   describe('the served window does not depend on the client position record', () => {
     let dir: tmp.DirResult;
 
