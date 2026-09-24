@@ -128,6 +128,7 @@ import {
   VideoTrackTimescaleOutputOption,
 } from '../options/OutputOption.ts';
 import { RealtimeBufferSizeInputOption } from '../options/input/RealtimeBufferSizeInputOption.ts';
+import { CopyTimestampInputOption } from '../options/input/CopyTimestampInputOption.ts';
 import { FrameRateOutputOption } from '../options/output/FrameRateOutputOption.ts';
 import { Pipeline } from './Pipeline.ts';
 import type { PipelineBuilder } from './PipelineBuilder.ts';
@@ -453,6 +454,34 @@ export abstract class BasePipelineBuilder implements PipelineBuilder {
           this.desiredState.videoTrackTimescale,
         ),
       );
+
+      // Copy input timestamps alongside a non-zero output offset.
+      //
+      // Without this, a non-zero `-ss` is an INPUT seek and the invocation's
+      // stats report the input position RELATIVE to the landing point, so
+      // nothing in the invocation can independently say where in the source a
+      // frame came from. With it, the input timestamps are preserved and the
+      // stats' `ti`/`ptsi` carry the ABSOLUTE source position - measured on a
+      // real item as 1260009ms for a requested 1260000ms, and 1255045ms when the
+      // seek was forced to land on an earlier keyframe, i.e. it reports the
+      // position actually reached rather than echoing the request.
+      //
+      // Gated to exactly this branch (a non-zero output offset) because that is
+      // where it was measured to leave the produced stream unchanged: identical
+      // segment boundaries and media PTS, with only the wall-clock anchor of
+      // PROGRAM-DATE-TIME moving by a constant per run. Where there is NO output
+      // offset - roughly 6% of logged invocations - copying timestamps would let
+      // pre-seek source positions into the published timeline, which is
+      // unmeasured and unnecessary.
+      //
+      // `hasInputOption` avoids a duplicate: the subtitle path already adds this
+      // option for its own reasons when a channel burns in text subtitles.
+      if (
+        this.videoInputSource &&
+        !this.videoInputSource.hasInputOption(CopyTimestampInputOption)
+      ) {
+        this.videoInputSource.addOption(new CopyTimestampInputOption());
+      }
     }
 
     if (isVideoPipelineContext(this.context)) {

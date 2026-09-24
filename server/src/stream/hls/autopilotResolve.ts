@@ -19,7 +19,10 @@
 import { execFileSync } from 'node:child_process';
 import { readdirSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import type { AutopilotEvidenceInput, AutopilotEvidenceResult } from './autopilotEvidence.ts';
+import type {
+  AutopilotEvidenceInput,
+  AutopilotEvidenceResult,
+} from './autopilotEvidence.ts';
 import { mapAuthenticatedStatsToClosedSegments } from './autopilotEvidence.ts';
 
 export type ResolvedSegment = {
@@ -66,7 +69,9 @@ export function parseSeekMs(args: readonly string[]): number {
 }
 
 /** First non-empty stats row's output PTS and time base. */
-export function firstStatsRow(text: string): { pts: number; tb: string } | null {
+export function firstStatsRow(
+  text: string,
+): { pts: number; tb: string } | null {
   const line = text.split(/\r?\n/).find((candidate) => candidate.trim() !== '');
   if (!line) return null;
   const [, pts, tb] = line.split(',');
@@ -75,7 +80,13 @@ export function firstStatsRow(text: string): { pts: number; tb: string } | null 
   return Number.isSafeInteger(value) ? { pts: value, tb } : null;
 }
 
-type InputRow = { ptsi: number; tiSeconds: number; ni: number };
+type InputRow = {
+  ptsi: number;
+  tiSeconds: number;
+  ni: number;
+  /** Output timestamp of the row, used to size a frame when `ni` is frozen. */
+  outputSeconds: number | undefined;
+};
 
 function parseTimeBase(value: string): number | undefined {
   const match = /^(\d+)\/(\d+)$/.exec(value);
@@ -92,9 +103,23 @@ function parseInputRows(text: string): InputRow[] {
     const tick = parseTimeBase(fields[4]!);
     const ptsi = Number(fields[3]);
     const ni = Number(fields[5]);
-    if (tick === undefined || !Number.isSafeInteger(ptsi) || !Number.isSafeInteger(ni))
+    if (
+      tick === undefined ||
+      !Number.isSafeInteger(ptsi) ||
+      !Number.isSafeInteger(ni)
+    )
       continue;
-    rows.push({ ptsi, tiSeconds: ptsi * tick, ni });
+    const outputTick = parseTimeBase(fields[2]!);
+    const outputPts = Number(fields[1]);
+    rows.push({
+      ptsi,
+      tiSeconds: ptsi * tick,
+      ni,
+      outputSeconds:
+        outputTick !== undefined && Number.isSafeInteger(outputPts)
+          ? outputPts * outputTick
+          : undefined,
+    });
   }
   return rows;
 }
@@ -109,33 +134,88 @@ export function deriveInputFrameSeconds(text: string): number | null {
   const seconds = last.tiSeconds - first.tiSeconds;
   if (frames <= 0 || seconds <= 0) return null;
   const frameSeconds = seconds / frames;
-  return Number.isFinite(frameSeconds) && frameSeconds > 0 ? frameSeconds : null;
+  return Number.isFinite(frameSeconds) && frameSeconds > 0
+    ? frameSeconds
+    : null;
 }
 
 /**
  * Verifies the input-seek basis from the invocation's own stats.
  *
- * A non-zero `-ss` is an INPUT seek, so `ti`/`ptsi` are RELATIVE to the landing
- * point and alone cannot say where in the source a frame really is. But `ni` is
- * the ABSOLUTE input frame index, so `ni / fps` is an independent source time.
- * When it agrees with the mapper's `requestedOffset + ptsi` within a frame, the
- * seek landed where it was asked to and a relative basis is safe; when it does
- * not (a keyframe pre-roll), the basis is genuinely unknown and the caller must
- * fail closed.
+ * Two regimes, because the invocation itself decides which one applies.
+ *
+ * WITH `-copyts` (input timestamps preserved) the stats' input-side values are
+ * ABSOLUTE source positions, so the attestation is direct: the first output
+ * packet must have come from the requested offset. Measured on a real item, the
+ * first row's `ptsi` was 1260009ms for a requested 1260000ms, and forcing the
+ * seek to land on an earlier keyframe moved it to 1255045ms - 4.955s early -
+ * while the request was unchanged. So this does not merely confirm the request
+ * was passed; it detects a seek that did not land where it was asked to. Only the
+ * first packet is asserted, because under `-copyts` these fields were observed
+ * constant across rows rather than advancing per frame.
+ *
+ * WITHOUT it, a non-zero `-ss` is an INPUT seek, so `ti`/`ptsi` are RELATIVE to
+ * the landing point and alone cannot say where in the source a frame really is.
+ * There, `ni` is treated as the absolute input frame index and `ni / fps` as an
+ * independent source time; when it agrees with `requestedOffset + ptsi` within a
+ * frame the seek landed where it was asked to. In practice real invocations
+ * report `ni` starting at 0, which fails this test - and that is the honest
+ * outcome, because nothing in the row then establishes the source position.
  */
 export function verifySeekBasis(
   text: string,
   requestedOffsetSeconds: number,
+  options: { copyTimestamps?: boolean } = {},
 ): boolean {
   const rows = parseInputRows(text);
   if (rows.length === 0) return false;
+
+  if (options.copyTimestamps) {
+    // Each regime requires only what it actually uses. In particular the
+    // relative rule's input-frame duration must NOT be required here: under
+    // `-copyts` the input frame index is frozen, so that duration is underivable
+    // and an earlier version of this function returned false before ever
+    // reaching this branch - refusing exactly the evidence the flag provides.
+    const tolerance = deriveOutputFrameSeconds(text);
+    if (tolerance === null) return false;
+    const first = [...rows].sort((left, right) => left.ni - right.ni)[0]!;
+    return Math.abs(first.tiSeconds - requestedOffsetSeconds) <= tolerance;
+  }
+
   const frameSeconds = deriveInputFrameSeconds(text);
   if (frameSeconds === null) return false;
+
   return rows.every(
     (row) =>
-      Math.abs(row.ni * frameSeconds - (requestedOffsetSeconds + row.tiSeconds)) <=
-      frameSeconds,
+      Math.abs(
+        row.ni * frameSeconds - (requestedOffsetSeconds + row.tiSeconds),
+      ) <= frameSeconds,
   );
+}
+
+/**
+ * The output frame duration, from the rows' own output timestamps.
+ *
+ * Needed because under `-copyts` the stats' input frame index was measured
+ * CONSTANT across rows (119, 119, 119 on a real invocation), so
+ * `deriveInputFrameSeconds` finds no frame progression there and cannot size a
+ * tolerance. The output timestamps advance in both regimes, so they give a frame
+ * duration either way.
+ */
+export function deriveOutputFrameSeconds(text: string): number | null {
+  const rows = parseInputRows(text)
+    .filter(
+      (row): row is InputRow & { outputSeconds: number } =>
+        row.outputSeconds !== undefined,
+    )
+    .sort((left, right) => left.outputSeconds - right.outputSeconds);
+  if (rows.length < 2) return null;
+  let smallest = Number.POSITIVE_INFINITY;
+  for (let index = 1; index < rows.length; index += 1) {
+    const delta = rows[index]!.outputSeconds - rows[index - 1]!.outputSeconds;
+    if (delta > 0 && delta < smallest) smallest = delta;
+  }
+  return Number.isFinite(smallest) && smallest > 0 ? smallest : null;
 }
 
 /** Regex matching the files an HLS `-hls_segment_filename` printf pattern names. */
@@ -156,7 +236,10 @@ export function parsePacketPts(text: string): number[] {
 
 /** `-show_entries stream=time_base -of default=nw=1:nk=1` prints one `a/b` line. */
 export function firstTimeBase(text: string): string | null {
-  const line = text.split(/\r?\n/).map((value) => value.trim()).find(Boolean);
+  const line = text
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .find(Boolean);
   return line !== undefined && /^\d+\/\d+$/.test(line) ? line : null;
 }
 
@@ -169,12 +252,26 @@ export const ffprobeRunner =
     execFileSync(ffprobePath, args, { encoding: 'utf8' });
 
 const packetArgs = (file: string) => [
-  '-v', 'error', '-select_streams', 'v:0',
-  '-show_entries', 'packet=pts', '-of', 'default=nw=1:nk=1', file,
+  '-v',
+  'error',
+  '-select_streams',
+  'v:0',
+  '-show_entries',
+  'packet=pts',
+  '-of',
+  'default=nw=1:nk=1',
+  file,
 ];
 const timeBaseArgs = (file: string) => [
-  '-v', 'error', '-select_streams', 'v:0',
-  '-show_entries', 'stream=time_base', '-of', 'default=nw=1:nk=1', file,
+  '-v',
+  'error',
+  '-select_streams',
+  'v:0',
+  '-show_entries',
+  'stream=time_base',
+  '-of',
+  'default=nw=1:nk=1',
+  file,
 ];
 
 /**
@@ -241,9 +338,15 @@ export async function resolveInvocation(
   },
   deps: ResolveDependencies,
 ): Promise<ResolveResult> {
-  if (record.kind !== 'invocation') return { ok: false, reason: 'not-an-invocation' };
+  if (record.kind !== 'invocation')
+    return { ok: false, reason: 'not-an-invocation' };
   const { invocationId, sourceId } = record;
-  if (!invocationId || !sourceId || record.pid === undefined || record.pid === null) {
+  if (
+    !invocationId ||
+    !sourceId ||
+    record.pid === undefined ||
+    record.pid === null
+  ) {
     return { ok: false, reason: 'missing-identity' };
   }
   if (!record.statsFile) return { ok: false, reason: 'no-stats-file' };
@@ -256,6 +359,9 @@ export async function resolveInvocation(
   if (!first) return { ok: false, reason: 'no-stats-rows' };
 
   const requestedOffsetSeconds = (record.requestedOffsetMs ?? 0) / 1000;
+  // Taken from the invocation itself rather than a separate field, so the basis
+  // rule cannot disagree with the command line that actually ran.
+  const copyTimestamps = args.includes('-copyts');
   const segments = await deps.probeSegments({
     pattern,
     startedAt: record.startedAt ?? '',
@@ -278,13 +384,19 @@ export async function resolveInvocation(
       mode: record.mode ?? 'transcode',
       authenticated: true,
       discontinuities: 'none',
-      // A non-zero INPUT seek is relative to the landing point, so the basis is
-      // only trustworthy when the stats' own absolute frame index (ni/fps)
-      // agrees with the relative mapping. Otherwise fail closed.
+      // With `-copyts` in the invocation the stats carry absolute source
+      // positions and the basis is verified directly; without it a non-zero
+      // INPUT seek is relative to the landing point, so the basis is only
+      // trustworthy when the stats' own frame index agrees with the relative
+      // mapping. Either way, anything unverified fails closed.
       seekBasis:
         requestedOffsetSeconds > 0
-          ? verifySeekBasis(statsRows, requestedOffsetSeconds)
-            ? 'verified-relative'
+          ? verifySeekBasis(statsRows, requestedOffsetSeconds, {
+              copyTimestamps,
+            })
+            ? copyTimestamps
+              ? 'verified-absolute'
+              : 'verified-relative'
             : 'unknown'
           : 'not-applicable',
     },

@@ -487,5 +487,58 @@ describe('BasePipelineBuilder', () => {
         inputArgs(buildWith({ realtime: false, suppressInputThrottle: true })),
       ).not.toContain('-readrate');
     });
+
+    // Stage 1 source receipt. Without `-copyts` a non-zero `-ss` leaves the
+    // invocation's stats reporting the input position RELATIVE to the seek
+    // landing, so nothing in the invocation can attest where in the source the
+    // item came from. Measured on a real item: adding it left the produced
+    // stream unchanged (same media PTS and segment boundaries; only the
+    // wall-clock anchor moved by a constant per run) and made the stats report
+    // the absolute source position - including detecting a seek that landed on
+    // an earlier keyframe.
+    const buildWithOffset = (ptsOffset: number) => {
+      const { video: v, audio: a } = freshInputs();
+      const withOffset = FfmpegState.create({
+        version: {
+          versionString: 'n7.0.2-15-g0458a86656-20240904',
+          majorVersion: 7,
+          minorVersion: 0,
+          patchVersion: 2,
+          isUnknown: false,
+        },
+      });
+      withOffset.ptsOffset = ptsOffset;
+      return new NoopPipelineBuilder(
+        v,
+        a,
+        null,
+        null,
+        null,
+        EmptyFfmpegCapabilities,
+      ).build(
+        withOffset,
+        // `videoTrackTimescale` is REQUIRED by the offset branch and defaults to
+        // null, so the branch is skipped without it - which is why nothing
+        // covered it until now.
+        framed({ videoTrackTimescale: 90_000 }),
+        DefaultPipelineOptions,
+      );
+    };
+
+    test('a non-zero output offset copies input timestamps, so the basis can be attested', () => {
+      expect(inputArgs(buildWithOffset(90_000))).toContain('-copyts');
+    });
+
+    test('no output offset means no timestamp copying, leaving those invocations unchanged', () => {
+      // Roughly 6% of logged invocations carry no offset. Copying timestamps
+      // there would let pre-seek source positions into the published timeline -
+      // unmeasured, and unnecessary, since those report no seek basis at all.
+      expect(inputArgs(buildWithOffset(0))).not.toContain('-copyts');
+    });
+
+    test('the option is added once even when another path already added it', () => {
+      const args = inputArgs(buildWithOffset(90_000));
+      expect(args.filter((arg) => arg === '-copyts')).toHaveLength(1);
+    });
   });
 });

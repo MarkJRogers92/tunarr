@@ -22,7 +22,18 @@ export type AutopilotEvidenceInput = {
     authenticated: boolean;
     discontinuities: 'none' | 'present' | 'unknown';
     /** Must be tied to this invocation and offset by the caller's attestation. */
-    seekBasis: 'not-applicable' | 'verified-relative' | 'unknown';
+    /**
+     * How the invocation's source position was established:
+     * `verified-absolute` when the invocation preserved input timestamps
+     * (`-copyts`), so the stats carry the real source position;
+     * `verified-relative` when a relative basis was confirmed against the stats'
+     * own frame index; `not-applicable` for no seek; `unknown` = refuse.
+     */
+    seekBasis:
+      | 'not-applicable'
+      | 'verified-absolute'
+      | 'verified-relative'
+      | 'unknown';
   };
   /** Raw rows in FFmpeg `n,pts,tb,ptsi,tbi,ni,ti` format. */
   statsRows: string;
@@ -103,7 +114,9 @@ type MappedSegment = {
   sourceRows: StatsRow[];
 };
 
-const fail = (reason: AutopilotEvidenceFailureReason): AutopilotEvidenceResult => ({
+const fail = (
+  reason: AutopilotEvidenceFailureReason,
+): AutopilotEvidenceResult => ({
   ok: false,
   reason,
 });
@@ -115,7 +128,11 @@ function parseTimeBase(value: string): number | undefined {
   }
   const numerator = Number(match[1]);
   const denominator = Number(match[2]);
-  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
+  if (
+    !Number.isFinite(numerator) ||
+    !Number.isFinite(denominator) ||
+    denominator <= 0
+  ) {
     return undefined;
   }
   const secondsPerTick = numerator / denominator;
@@ -128,7 +145,10 @@ function parseStatsRows(
   raw: string,
   requestedOffsetSeconds: number,
 ): StatsRow[] | undefined {
-  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
   if (lines.length === 0) {
     return undefined;
   }
@@ -216,7 +236,8 @@ export function mapAuthenticatedStatsToClosedSegments(
   }
   if (
     (expected.requestedOffsetSeconds > 0 &&
-      invocation.seekBasis !== 'verified-relative') ||
+      invocation.seekBasis !== 'verified-relative' &&
+      invocation.seekBasis !== 'verified-absolute') ||
     (expected.requestedOffsetSeconds === 0 &&
       invocation.seekBasis !== 'not-applicable')
   ) {
@@ -232,7 +253,8 @@ export function mapAuthenticatedStatsToClosedSegments(
     input.processOrigin.invocationId !== expected.invocationId ||
     input.processOrigin.processId !== expected.processId ||
     input.processOrigin.sourceId !== expected.sourceId ||
-    input.processOrigin.requestedOffsetSeconds !== expected.requestedOffsetSeconds ||
+    input.processOrigin.requestedOffsetSeconds !==
+      expected.requestedOffsetSeconds ||
     input.processOrigin.videoStreamIndex !== expected.videoStreamIndex
   ) {
     return fail('identity-mismatch');
@@ -249,7 +271,10 @@ export function mapAuthenticatedStatsToClosedSegments(
     }
   }
 
-  const rawLines = input.statsRows.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const rawLines = input.statsRows
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
   if (rawLines.length === 0) {
     return fail('missing-stats');
   }
@@ -284,15 +309,20 @@ export function mapAuthenticatedStatsToClosedSegments(
     rows.length < 2 ||
     !Number.isFinite(outputStep) ||
     outputStep <= 0 ||
-    outputTimes.some((time, index) => index > 0 && time - outputTimes[index - 1]! <= tolerance) ||
-    sourceTimes.some((time, index) => index > 0 && time - sourceTimes[index - 1]! <= tolerance)
+    outputTimes.some(
+      (time, index) => index > 0 && time - outputTimes[index - 1]! <= tolerance,
+    ) ||
+    sourceTimes.some(
+      (time, index) => index > 0 && time - sourceTimes[index - 1]! <= tolerance,
+    )
   ) {
     return fail('non-monotonic-source-coverage');
   }
   for (let i = 1; i < rows.length; i++) {
     if (
-      Math.abs((outputTimes[i]! - outputTimes[i - 1]!) - outputStep) > tolerance ||
-      Math.abs((sourceTimes[i]! - sourceTimes[i - 1]!) - outputStep) > tolerance
+      Math.abs(outputTimes[i]! - outputTimes[i - 1]! - outputStep) >
+        tolerance ||
+      Math.abs(sourceTimes[i]! - sourceTimes[i - 1]! - outputStep) > tolerance
     ) {
       return fail('non-contiguous-source-coverage');
     }
@@ -301,7 +331,9 @@ export function mapAuthenticatedStatsToClosedSegments(
   const outputOriginSeconds = input.processOrigin.outputPts * outputOriginTick;
   const muxOriginSeconds = input.processOrigin.muxPts * muxOriginTick;
   if (
-    !outputTimes.some((time) => Math.abs(time - outputOriginSeconds) <= tolerance) ||
+    !outputTimes.some(
+      (time) => Math.abs(time - outputOriginSeconds) <= tolerance,
+    ) ||
     !input.segments.some((segment) => {
       const tick = parseTimeBase(segment.timeBase);
       return (
@@ -367,15 +399,22 @@ export function mapAuthenticatedStatsToClosedSegments(
       return fail('segment-gap-or-overlap');
     }
     if (
-      !outputTimes.some((time) => Math.abs(time - segment.startSeconds) <= tolerance) ||
-      !outputTimes.some((time) => Math.abs(time - segment.endSeconds) <= tolerance)
+      !outputTimes.some(
+        (time) => Math.abs(time - segment.startSeconds) <= tolerance,
+      ) ||
+      !outputTimes.some(
+        (time) => Math.abs(time - segment.endSeconds) <= tolerance,
+      )
     ) {
       return fail('segment-does-not-match-stats');
     }
   }
   if (
     Math.abs(mappedSegments[0]!.startSeconds - outputTimes[0]!) > tolerance ||
-    Math.abs(mappedSegments[mappedSegments.length - 1]!.endSeconds - outputTimes.at(-1)!) > tolerance
+    Math.abs(
+      mappedSegments[mappedSegments.length - 1]!.endSeconds -
+        outputTimes.at(-1)!,
+    ) > tolerance
   ) {
     return fail('segment-does-not-match-stats');
   }
@@ -385,7 +424,9 @@ export function mapAuthenticatedStatsToClosedSegments(
     .sort((a, b) => a - b);
   if (
     packetOutputTimes.length !== outputTimes.length ||
-    packetOutputTimes.some((time, index) => Math.abs(time - outputTimes[index]!) > tolerance)
+    packetOutputTimes.some(
+      (time, index) => Math.abs(time - outputTimes[index]!) > tolerance,
+    )
   ) {
     return fail('video-packet-pts-mismatch');
   }
