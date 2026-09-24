@@ -102,14 +102,36 @@ function makeChannel(): ChannelOrmWithTranscodeConfig {
   } as unknown as ChannelOrmWithTranscodeConfig;
 }
 
+type HarnessOptions = {
+  /**
+   * Whether the channel's lineup carries an onDemandConfig, i.e. whether this is
+   * an on-demand channel. Defaults to true so the pre-existing staleness and
+   * cleanup tests keep exercising the retirement path; the tests for continuous
+   * (non-on-demand) channels pass false.
+   */
+  onDemand?: boolean;
+  /** Rejection to raise from loadAllLineupConfigs, for the fail-closed test. */
+  lineupFailure?: Error;
+};
+
 function makeSessionManager(
   hlsFactory: (
     channel: ChannelOrmWithTranscodeConfig,
     options: HlsSessionOptions,
   ) => StubHlsSession,
+  harness: HarnessOptions = {},
 ) {
+  const { onDemand = true, lineupFailure } = harness;
   const channelDB: Partial<IChannelDB> = {
     getChannelOrm: vi.fn().mockResolvedValue(makeChannel()),
+    loadAllLineupConfigs: lineupFailure
+      ? vi.fn().mockRejectedValue(lineupFailure)
+      : vi.fn().mockResolvedValue({
+          [channelUuid]: {
+            channel: makeChannel(),
+            lineup: onDemand ? { onDemandConfig: { state: 'playing' } } : {},
+          },
+        }),
   };
 
   const onDemandService: Partial<OnDemandChannelService> = {
@@ -418,6 +440,81 @@ describe('SessionManager', () => {
 
       // Session should still be in the manager — cleanup was aborted
       // because #connections is non-empty when the timer fires
+      expect(manager.getHlsSession(channelUuid)).toBe(session);
+    });
+  });
+
+  // A channel with no onDemandConfig is continuous, not on-demand: its producer
+  // is supposed to keep running with zero viewers. Retiring it stopped FFmpeg,
+  // and the next request created a session that DELETES and rebuilds the
+  // channel's working directory, so MEDIA-SEQUENCE restarted at 0 and the
+  // published timeline reset - seen live as a channel that rewound on its own
+  // about two minutes after its last viewer left.
+  describe('idle producers on continuous (non-on-demand) channels', () => {
+    async function idleSession(harness: HarnessOptions = {}) {
+      const sessions: StubHlsSession[] = [];
+      const manager = makeSessionManager((channel, options) => {
+        const s = new StubHlsSession(channel, options);
+        sessions.push(s);
+        return s;
+      }, harness);
+
+      await manager.getOrCreateHlsSession(channelUuid, '10.0.0.1', connection, {
+        streamMode: 'hls',
+      });
+
+      // The viewer leaves; nothing refreshes the heartbeat.
+      vi.advanceTimersByTime(121_000);
+      return { manager, session: sessions[0]! };
+    }
+
+    it('keeps producing when the channel is not on-demand', async () => {
+      const { manager, session } = await idleSession({ onDemand: false });
+
+      await manager.cleanupStaleSessions();
+      // Advanced ASYNCHRONOUSLY on purpose. A synchronous advance would leave the
+      // stop() promise chain unresolved when the assertion runs, so the session
+      // would look alive even if it had in fact been retired - the test would
+      // pass against the unfixed code.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(manager.getHlsSession(channelUuid)).toBe(session);
+      expect(session.state).toBe('started');
+    });
+
+    it('still retires an idle session when the channel IS on-demand', async () => {
+      const { manager } = await idleSession({ onDemand: true });
+
+      await manager.cleanupStaleSessions();
+      // Async because the grace period fires a timer whose handler awaits
+      // session.stop() before the session is dropped from the manager.
+      await vi.advanceTimersByTimeAsync(16_000);
+
+      expect(manager.getHlsSession(channelUuid)).toBeUndefined();
+    });
+
+    it('still prunes stale connections on a continuous channel', async () => {
+      // The session survives, but the dead connection must not: a stale entry
+      // also holds that client's recorded segment position, which the playlist
+      // trim reads as its window anchor. Nothing else would ever clear it.
+      const { manager, session } = await idleSession({ onDemand: false });
+
+      await manager.cleanupStaleSessions();
+
+      expect(session.isKnownConnection('10.0.0.1')).toBe(false);
+      expect(manager.getHlsSession(channelUuid)).toBe(session);
+    });
+
+    it('retires nothing at all when the lineups cannot be read', async () => {
+      // Fail closed: without the lineups we cannot tell which channels are
+      // on-demand, and leaving a producer running is the safer error.
+      const { manager, session } = await idleSession({
+        lineupFailure: new Error('lineup store unavailable'),
+      });
+
+      await manager.cleanupStaleSessions();
+      await vi.advanceTimersByTimeAsync(16_000);
+
       expect(manager.getHlsSession(channelUuid)).toBe(session);
     });
   });

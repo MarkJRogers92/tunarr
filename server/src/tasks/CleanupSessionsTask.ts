@@ -11,21 +11,18 @@ import { simpleTaskDef } from './TaskRegistry.ts';
   description: 'Cleans stale sessions from the stream session manager',
 })
 export class CleanupSessionsTask extends SimpleTask {
-  @InjectLogger() protected declare readonly logger: Logger;
+  @InjectLogger() declare protected readonly logger: Logger;
 
   static KEY = Symbol.for(CleanupSessionsTask.name);
   public static ID: TaskId = 'cleanup-sessions';
   public ID = CleanupSessionsTask.ID;
 
-  constructor(
-    @inject(SessionManager) private sessionManager: SessionManager,
-  ) {
+  constructor(@inject(SessionManager) private sessionManager: SessionManager) {
     super();
   }
 
-  // eslint-disable-next-line @typescript-eslint/require-await
   protected async runInternal(): Promise<void> {
-    this.sessionManager.cleanupStaleSessions();
+    await this.sessionManager.cleanupStaleSessions();
   }
 
   get taskName() {

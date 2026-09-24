@@ -164,12 +164,56 @@ export class SessionManager {
     });
   }
 
-  cleanupStaleSessions() {
+  async cleanupStaleSessions() {
+    // Only an ON-DEMAND channel's producer may be retired for idleness.
+    //
+    // A channel with no onDemandConfig is a continuous channel: its session is
+    // meant to keep producing with zero viewers, and the on-demand path - not
+    // this task - is what pauses a channel that has gone quiet
+    // (OnDemandChannelStateTask). Retiring one here stopped its FFmpeg, and the
+    // next request built a NEW session whose initDirectories() calls
+    // cleanupDirectory(), which DELETES the channel's working directory: the
+    // published MEDIA-SEQUENCE restarts at 0 and the whole timeline is rebuilt
+    // from the current wall clock. Observed live as a channel that rewound on
+    // its own roughly two minutes after the last viewer left.
+    //
+    // Fail closed: if the lineups cannot be read we cannot tell which channels
+    // are on-demand, and keeping a producer alive is always the safer error.
+    let onDemandChannels: Set<string>;
+    try {
+      const lineups = await this.channelDB.loadAllLineupConfigs();
+      onDemandChannels = new Set(
+        values(lineups)
+          .filter(({ lineup }) => !isUndefined(lineup.onDemandConfig))
+          .map(({ channel }) => channel.uuid),
+      );
+    } catch (e) {
+      this.logger.error(e, 'Could not load channel lineups');
+      return;
+    }
+
     for (const session of Object.values(this.#sessions)) {
       if (session.state === 'starting') {
         continue;
       }
-      if (session.isStale() && session.scheduleCleanup()) {
+
+      // Evaluate this for EVERY session, whichever way the retirement goes:
+      // isStale() prunes the session's stale connections as a side effect, and
+      // anything skipped here keeps those entries (and their per-IP segment
+      // positions) alive forever.
+      if (!session.isStale()) {
+        continue;
+      }
+
+      if (!onDemandChannels.has(session.keyObj.id)) {
+        this.logger.debug(
+          this.getLoggerContext(session.id),
+          'Session is idle but its channel is continuous, not on-demand. Keeping it alive',
+        );
+        continue;
+      }
+
+      if (session.scheduleCleanup()) {
         this.logger.debug(
           this.getLoggerContext(session.id),
           'Scheduled cleanup on session',
